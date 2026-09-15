@@ -343,6 +343,29 @@ def _regraft(dlss_linear: np.ndarray, reference_srgb: np.ndarray | None, amount:
     return contract.srgb_to_linear(np.clip(grafted, 0.0, 1.0))
 
 
+#: Frequency split for the tone transfer. Small enough that only fine detail is
+#: kept from the boosted image; everything broader (lighting, contrast, colour)
+#: comes from the native neural pass, so the cinematic look is not diluted.
+BOOST_TONE_RADIUS = 4.0
+
+
+def _transfer_tone(detail_linear: np.ndarray, tone_linear: np.ndarray, radius: float) -> np.ndarray:
+    """Keep ``detail_linear``'s fine detail but take its tone from ``tone_linear``.
+
+    The DLSS neural pass's look (contrast, saturation, relighting) weakens as the
+    working resolution rises, so a boosted or tiled result comes back sharper but
+    flatter than a native pass. This lays the native pass's low/mid band (the
+    look) under the high-frequency detail of the boosted result, restoring the
+    cinematic contrast without giving up the detail. Both are native-size linear.
+    """
+    if detail_linear.shape != tone_linear.shape:
+        return detail_linear
+    radius = max(0.5, float(radius))
+    tone_low = cv2.GaussianBlur(tone_linear, (0, 0), radius)
+    detail_low = cv2.GaussianBlur(detail_linear, (0, 0), radius)
+    return np.maximum(tone_low + (detail_linear - detail_low), 0.0)
+
+
 def _run_ultra_stream(
     source_srgb: np.ndarray,
     inverse_depth: np.ndarray,
@@ -378,6 +401,21 @@ def _run_ultra_stream(
     tiles = tiling.plan_tiles(big_w, big_h, tile_max, overlap)
     regraft = settings.detail.sr_regraft if engine is not None else 0.0
 
+    # One native-resolution DLSS pass, up front, purely for its look. The neural
+    # pass's contrast/colour/relighting weakens as the working resolution rises,
+    # so every big tile comes back sharp but flat. This native pass carries the
+    # true cinematic tone; per tile we lay its low/mid band under the tile's fine
+    # detail (see _transfer_tone), exactly as Boost does. Native is small, so this
+    # is one cheap extra evaluation, and it fixes both the full image and the
+    # preview downscale at once.
+    if say:
+        say("Ultra Detail: capturing the neural look at native size…")
+    native_look = evaluate(
+        np.ascontiguousarray(contract.srgb_to_linear(np.clip(source_srgb, 0.0, 1.0))),
+        np.ascontiguousarray(inverse_depth),
+        tiling.Tile(0, 0, w, h),
+    )
+
     merger = tiling.StreamMerger(big_h, big_w, 3, overlap, scratch)
     # Native downscale is small, so it is merged in RAM from per-tile downscales.
     native_overlap = max(1, int(round(overlap * w / big_w)))
@@ -408,14 +446,30 @@ def _run_ultra_stream(
                 merged_linear, amount=ULTRA_TILE_SHARPEN_AMOUNT,
                 radius=ULTRA_TILE_SHARPEN_RADIUS, preserve_range=True,
             )
+
+            # Transfer the native pass's tone onto this tile. The tone correction
+            # is a smooth low-frequency delta computed at native size (cheap): take
+            # the tile's own native downscale, lay the native look's low/mid band
+            # under it (Boost-style, BOOST_TONE_RADIUS), and add the difference
+            # back to the full-size tile. This restores the cinematic contrast and
+            # colour without touching the tile's genuinely new fine detail.
+            n_tile = tiling.Tile(nx0, ny0, nx1 - nx0, ny1 - ny0)
+            native_patch = cv2.resize(
+                merged_linear, (n_tile.w, n_tile.h), interpolation=cv2.INTER_AREA
+            )
+            tone_region = np.ascontiguousarray(native_look[ny0:ny1, nx0:nx1])
+            corrected_patch = _transfer_tone(native_patch, tone_region, BOOST_TONE_RADIUS)
+            tone_delta = cv2.resize(
+                corrected_patch - native_patch, (tile.w, tile.h),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            merged_linear = np.maximum(merged_linear + tone_delta, 0.0)
             merger.add(tile, merged_linear)
 
             # A native-sized downscale of this tile, for the native copy/preview.
-            n_tile = tiling.Tile(nx0, ny0, nx1 - nx0, ny1 - ny0)
+            # Use the tone-corrected patch so the preview matches the full image.
             native_tiles.append(n_tile)
-            native_patches.append(
-                cv2.resize(merged_linear, (n_tile.w, n_tile.h), interpolation=cv2.INTER_AREA)
-            )
+            native_patches.append(corrected_patch)
 
         if say:
             say("Ultra Detail: writing the full-resolution image to disk…")
@@ -494,8 +548,11 @@ def convert(
     native_wh = (width, height)
     free_bytes = _free_vram_bytes()
     mode = settings.detail.mode
-    # SR runs before DLSS in Boost/Ultra; None means Lanczos (model off/missing).
-    sr_engine = _make_upscale_engine(settings, say) if mode in ("boost", "ultra") else None
+    # AI upscale is Ultra-only. In Boost the SR model reconstructs structure but
+    # smooths true micro-texture (skin pores), which the shrink-back then loses,
+    # so Boost stays pure Lanczos supersample + sharpen (measured better). None
+    # here means the Lanczos path.
+    sr_engine = _make_upscale_engine(settings, say) if mode == "ultra" else None
     regraft = settings.detail.sr_regraft if sr_engine is not None else 0.0
 
     if mode == "ultra":
@@ -575,6 +632,15 @@ def convert(
                 enhanced_linear, amount=BOOST_POST_SHARPEN_AMOUNT,
                 radius=BOOST_POST_SHARPEN_RADIUS, preserve_range=True,
             )
+            # The big pass gives detail but a diluted neural look. Run a native
+            # pass for the real cinematic tone and lay it under the boost detail.
+            say("Detail boost: restoring the neural look at native size…")
+            native_look = _evaluate_linear(
+                status.harness, linear, inverse_depth,
+                settings=settings, scratch=scratch, out_path=out_path,
+                colour_path=colour_path, label="native", progress=progress,
+            )
+            enhanced_linear = _transfer_tone(enhanced_linear, native_look, BOOST_TONE_RADIUS)
             detail_note = f", boost ×{factor:.1f}" + (" (AI)" if sr_engine is not None else "")
         else:
             # Already near the ceiling: supersampling would gain a few percent for

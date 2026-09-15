@@ -4589,8 +4589,9 @@ class MainWindow(QMainWindow):
         mode = self.settings.detail.mode
         is_ultra = mode == "ultra"
         if hasattr(self, "detail_sr_row"):
-            # AI upscale applies to both enlarge modes; hidden for Off.
-            self.detail_sr_row.setVisible(mode in ("boost", "ultra"))
+            # AI upscale is Ultra-only now — in Boost it smooths micro-texture, so
+            # Boost stays pure Lanczos + sharpen.
+            self.detail_sr_row.setVisible(is_ultra)
             self.detail_sr_model.setEnabled(self.detail_sr_enabled.isChecked())
         if hasattr(self, "detail_ultra_row"):
             self.detail_ultra_row.setVisible(is_ultra)
@@ -4604,15 +4605,10 @@ class MainWindow(QMainWindow):
         self.settings.detail.sr_enabled = bool(on)
         if hasattr(self, "detail_sr_model"):
             self.detail_sr_model.setEnabled(on)
-        if on:
-            # AI upscale reconstructs detail before DLSS, so sub-pixel jitter (a
-            # temporal AA trick) mostly adds softening here, and a couple of DLSS
-            # passes is plenty. Set both to sensible values; the widgets' own
-            # handlers persist them. The user can still change them afterwards.
-            if hasattr(self, "jitter"):
-                self.jitter.setChecked(False)
-            if hasattr(self, "frames"):
-                self.frames.setValue(2)
+        # NB: earlier this auto-set jitter off and passes to 2. That was wrong —
+        # jitter and multiple passes are exactly what give the neural pass its
+        # accumulated volume, depth and contrast, so forcing them off flattened
+        # the result. Leave the user's jitter and passes untouched.
         self.settings.save(paths.settings_path())
 
     def _detail_sr_model_changed(self, _index: int) -> None:

@@ -27,6 +27,21 @@ pinned to the frame corners as you zoom.
 
 ![Before/after wipe, divider near the left — the neural pass at full strength](app_images_examples/aftersplit.png)
 
+**Ultra Detail** rebuilds the image at a much larger size, running the neural
+pass over the picture in overlapping tiles and merging them, so detail goes past
+what a single pass can hold. Turn on AI upscale and it reconstructs real texture
+before the neural pass, then grafts that texture back so anti-aliasing cannot
+erase it. The result is a genuinely huge image, saved as PNG, JPEG or TIFF.
+
+![Ultra Detail, before and after on an eye](app_images_examples/ultra_before.png)
+
+![Ultra Detail, the reconstructed result](app_images_examples/ultra_after.png)
+
+The output is large. A 4K source at Ultra becomes tens of thousands of pixels on
+the long edge:
+
+![Ultra Detail size comparison against the source](app_images_examples/ultra_size_example.png)
+
 **Compare styles** converts the image as both Natural and Cinematic at once, so
 you choose between them instead of guessing. Two panes, or three with the source
 alongside — every pane shares one zoom and pan.

@@ -6,9 +6,7 @@ from pathlib import Path
 
 from dlss5_converter import pipeline
 from dlss5_converter.settings import (
-    D3D12_MAX_TEXTURE_DIMENSION,
     NR_STYLES,
-    max_boost_factor,
     style_slug,
 )
 
@@ -41,15 +39,14 @@ def test_output_name_without_a_style_is_unchanged(tmp_path):
     assert out.name == "shot_dlss5.png"
 
 
-def test_max_boost_factor_tracks_the_texture_limit():
-    # 3840 (the 4K default): 8x would be 30720, past the limit, so 4x is the top.
-    assert max_boost_factor(3840) == 4
-    # 2048: even 8x (16384) exactly fits.
-    assert max_boost_factor(2048) == 8
-    # 8192: only 2x (16384) fits - jerkalerk's "8192 is the actual limit".
-    assert max_boost_factor(8192) == 2
-    # Above 8192 nothing fits: Boost cannot supersample at all.
-    assert max_boost_factor(12000) == 0
-    # The knee is exactly the texture limit over the smallest factor.
-    assert max_boost_factor(D3D12_MAX_TEXTURE_DIMENSION // 2) == 2
-    assert max_boost_factor(D3D12_MAX_TEXTURE_DIMENSION // 2 + 1) == 0
+def test_output_format_override_forces_the_extension(tmp_path):
+    """Apply-to-folder's 'Save as' choice overrides the source-derived type."""
+    # SDR source, forced to JPEG.
+    out = pipeline.hdr_output_path(tmp_path, "shot", tmp_path / "shot.png", "cinematic", fmt="jpg")
+    assert out.name == "shot_dlss5_cinematic.jpg"
+    # HDR source that would default to .jxr, forced to PNG.
+    out = pipeline.hdr_output_path(tmp_path, "shot", tmp_path / "shot.jxr", fmt="png")
+    assert out.name == "shot_dlss5.png"
+    # A leading dot in the format is tolerated.
+    out = pipeline.hdr_output_path(tmp_path, "shot", tmp_path / "shot.png", fmt=".tif")
+    assert out.name == "shot_dlss5.tif"

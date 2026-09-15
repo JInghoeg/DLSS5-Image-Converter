@@ -56,3 +56,37 @@ def query_nvidia_vram() -> VramInfo | None:
     if total <= 0 or free < 0:
         return None
     return VramInfo(parts[0], total, used, free)
+
+
+def query_system_ram() -> int | None:
+    """Free system RAM in bytes, or None when it cannot be determined.
+
+    Ultra Detail merges its tiles into an ordinary host array, so its real limit
+    is system memory, not VRAM — a 32K×32K merge needs ~16 GB of accumulator
+    before the save buffer. This uses the Win32 API directly (via ctypes) so it
+    adds no dependency; on a non-Windows host or any failure it returns None and
+    the caller falls back to a conservative fixed ceiling.
+    """
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(status.ullAvailPhys)
+    except Exception:  # noqa: BLE001 - a missing API must degrade, never block
+        return None

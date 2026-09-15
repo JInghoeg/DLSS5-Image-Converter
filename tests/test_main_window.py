@@ -312,54 +312,89 @@ def test_tutorial_uses_real_controls_and_skip_persists(window, monkeypatch, tmp_
     assert "Replay introduction…" in replay_labels
 
 
-def test_boost_offers_two_four_and_eight_without_a_fixed_8k_cap(window):
-    factors = [
-        window.detail_supersample.itemData(index)
-        for index in range(window.detail_supersample.count())
-    ]
-    assert factors == [2, 4, 8]
+def test_detail_offers_off_boost_and_ultra(window):
+    """The three modes, no level control: Boost and Ultra size themselves."""
     labels = [button.text() for button in window.detail_mode.findChildren(gui.QPushButton)]
+    assert "Off" in labels
     assert "Boost" in labels
-    assert "Boost 4×" not in labels
+    assert "Ultra Detail" in labels
+    # The retired 2×/4×/8× sharpness control is gone entirely.
+    assert not hasattr(window, "detail_supersample")
 
 
-def test_boost_levels_read_as_plain_names(window):
-    """No 2×/4×/8× jargon in the sharpness control - Standard/High/Max instead."""
-    names = [
-        window.detail_supersample.itemText(i)
-        for i in range(window.detail_supersample.count())
-    ]
-    assert names == ["Standard", "High", "Max"]
+def test_detail_hint_tracks_the_selected_mode(window):
+    """Each mode's explainer line is set when the mode is synced."""
+    window.settings.detail.mode = "ultra"
+    window._sync_detail_controls()
+    assert "tiles" in window.detail_hint.text().lower()
+    window.settings.detail.mode = "off"
+    window._sync_detail_controls()
+    assert "plain dlss" in window.detail_hint.text().lower()
 
 
-def test_boost_guard_disables_levels_that_overflow_the_texture_limit(window):
-    """At a high Max size the big levels are greyed and the choice steps down.
-
-    This is jerkalerk's InvalidParameter error turned into a prevented, spoken
-    state: 8192 px only leaves room for the smallest level (8192×2 = 16384).
-    """
+def test_ultra_size_row_shows_only_in_ultra_and_reports_pixels(window):
+    """The size multiplier + result line appear only for Ultra, and the line
+    reports the real pixel size once an image is loaded."""
+    prepare(window)  # 96×64 source
     window.settings.detail.mode = "boost"
-    window.settings.detail.supersample = 8  # "Max"
-    window.settings.evaluation.max_edge = 8192
-    window._sync_boost_guard()
+    window._sync_detail_controls()
+    assert not window.detail_ultra_row.isVisibleTo(window.detail_card)
 
-    # Stepped down to the only level that fits, and said so. (isVisible() is
-    # False in an unshown test window, so assert the message text instead.)
-    assert window.settings.detail.supersample == 2
-    assert window.detail_guard.text() != ""
-    assert not window.detail_guard.isHidden()
-    model = window.detail_supersample.model()
-    enabled = [model.item(i).isEnabled() for i in range(window.detail_supersample.count())]
-    assert enabled == [True, False, False]  # Standard fits; High and Max do not
+    window.settings.detail.mode = "ultra"
+    idx = window.detail_ultra_factor.findData(4.0)
+    window.detail_ultra_factor.setCurrentIndex(idx)
+    window._sync_detail_controls()
+    # 96×64 at 4× → 384×256.
+    assert "384×256" in window.detail_ultra_size.text()
+    assert window.settings.detail.ultra_factor == 4.0
 
 
-def test_boost_guard_reports_when_nothing_fits(window):
-    """Above 8192 px even the smallest level overflows: Boost cannot supersample."""
-    window.settings.detail.mode = "boost"
-    window.settings.evaluation.max_edge = 12000
-    window._sync_boost_guard()
-    assert "8192" in window.detail_guard.text()
-    assert not window.detail_guard.isHidden()
+def test_ultra_save_moves_only_the_full_res_file(window, tmp_path):
+    """Ultra save moves the streamed super-resolution file into place and writes
+    NOTHING else — the soft downscaled native copy was dropped on purpose."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    src = scratch / "ultra_full.tiff"
+    src.write_bytes(b"BIGTIFFDATA")  # stand-in for the streamed file
+    window.result = pipeline.Result(
+        original=frame(0.3),
+        enhanced=frame(0.6),
+        depth_preview=np.zeros((64, 96, 3), np.uint8),
+        notes="test",
+        ultra_full_path=src,
+        ultra_full_size=(384, 256),
+    )
+    super_dest = tmp_path / "shot_ultra_2K.tiff"
+    super_path = window._save_ultra(super_dest)
+
+    assert super_path.exists() and super_path.read_bytes() == b"BIGTIFFDATA"
+    assert not src.exists()                                  # moved, not copied
+    assert not (tmp_path / "shot_native.png").exists()       # no native copy
+    assert window.result.ultra_full_path == super_dest       # view chip still resolves
+
+
+def test_ultra_save_reencodes_to_png_on_the_fly(window, tmp_path):
+    """Saving Ultra as a non-TIFF re-encodes the scratch BigTIFF to that type, so
+    people who can't open a TIFF still get a usable file. The scratch file stays."""
+    tifffile = pytest.importorskip("tifffile")
+    from dlss5_converter import bigtiff
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    src = scratch / "ultra_full.tiff"
+    img = np.full((40, 60, 3), 0.5, np.float32)
+    bigtiff.write_streaming(src, 40, 60, iter([(0, img)]), bits=16)
+    window.result = pipeline.Result(
+        original=frame(0.3), enhanced=frame(0.6),
+        depth_preview=np.zeros((64, 96, 3), np.uint8), notes="test",
+        ultra_full_path=src, ultra_full_size=(60, 40),
+    )
+    dest = tmp_path / "shot_ultra_0K.png"
+    out = window._save_ultra(dest)
+    assert out.exists() and out.suffix == ".png"
+    assert src.exists()                                       # scratch kept for re-save
+    import cv2
+    decoded = cv2.imread(str(out), cv2.IMREAD_UNCHANGED)
+    assert decoded is not None and decoded.shape[:2] == (40, 60)
 
 
 # -- what a run looks like while it is running -------------------------------

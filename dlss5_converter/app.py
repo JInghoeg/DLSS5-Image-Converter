@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -46,12 +48,14 @@ from . import (
     effects,
     evaluator,
     grade,
+    hardware,
     onboarding,
     paths,
     pipeline,
     resample,
     runtime,
     sequence,
+    tiling,
     video,
 )
 from . import __version__
@@ -61,10 +65,7 @@ from .depth_engine import MODELS, DepthEngine
 from .onnx_depth import SMALL as SMALL_DEPTH_MODEL
 from .onnx_depth import OnnxDepthEngine
 from .settings import (
-    BOOST_LEVEL_LABELS,
-    DETAIL_BOOST_FACTORS,
     MAX_EDGE_CHOICES,
-    max_boost_factor,
     NR_COLOR_MAX,
     NR_PAPER_WHITE_MAX,
     ONBOARDING_VERSION,
@@ -246,7 +247,7 @@ QSlider::handle:horizontal {
 }
 QSlider::handle:horizontal:hover { border-color: $signal_light; }
 
-QComboBox { background: $base; color: $ink; border: 1px solid $line; border-radius: 9px; padding: 7px 12px; }
+QComboBox { background: $base; color: $ink; border: 1px solid $line; border-radius: 9px; padding: 7px 12px; min-height: 20px; }
 QComboBox:hover { border-color: $signal_deep; }
 QComboBox:disabled { color: $ink_faint; border-color: $line_soft; }
 QComboBox::drop-down { border: none; width: 22px; }
@@ -263,8 +264,28 @@ QComboBox QAbstractItemView {
     background: $panel_lo; color: $ink; border: 1px solid $line;
     selection-background-color: $line; outline: none; padding: 4px;
 }
-QSpinBox { background: $base; color: $ink; border: 1px solid $line; border-radius: 9px; padding: 6px 8px; }
+QSpinBox { background: $base; color: $ink; border: 1px solid $line; border-radius: 9px; padding: 6px 8px; min-height: 20px; }
 QSpinBox:hover { border-color: $signal_deep; }
+/* Qt's default spin arrows are near-invisible on the dark theme. Draw our own
+   from borders (like the combo chevron) so up/down are legible. */
+QSpinBox::up-button, QSpinBox::down-button {
+    subcontrol-origin: border; width: 18px; background: $panel_hi; border-left: 1px solid $line;
+}
+QSpinBox::up-button { subcontrol-position: top right; border-top-right-radius: 8px; }
+QSpinBox::down-button { subcontrol-position: bottom right; border-bottom-right-radius: 8px; }
+QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: $panel_hi; border-left-color: $signal_deep; }
+QSpinBox::up-arrow {
+    width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-bottom: 5px solid $ink_dim;
+}
+QSpinBox::down-arrow {
+    width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-top: 5px solid $ink_dim;
+}
+QSpinBox::up-arrow:hover { border-bottom-color: $signal; }
+QSpinBox::down-arrow:hover { border-top-color: $signal; }
+QSpinBox::up-arrow:disabled { border-bottom-color: $line; }
+QSpinBox::down-arrow:disabled { border-top-color: $line; }
 
 QCheckBox { color: $ink; spacing: 8px; background: transparent; }
 QCheckBox::indicator { width: 17px; height: 17px; border-radius: 5px; border: 1px solid $line; background: $base; }
@@ -376,6 +397,14 @@ QFrame#viewBar QPushButton#viewChip:checked {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $signal, stop:1 $signal_deep);
 }
 QFrame#viewBar QPushButton#viewChip:disabled { color: $ink_faint; background: transparent; }
+QFrame#viewBar QPushButton#fullResChip {
+    background: $signal_deep; color: $on_accent; border: 1px solid $signal;
+    border-radius: 8px; padding: 6px 14px; font-weight: 700; font-size: 12px;
+}
+QFrame#viewBar QPushButton#fullResChip:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $signal, stop:1 $signal_deep);
+    color: $on_accent;
+}
 """)
 
 
@@ -538,11 +567,50 @@ class Worker(QObject):
                 self._engine,
                 progress=self.progress.emit,
                 prepared=self._prepared,
+                # Ultra bakes the look into the source (its output is too large to
+                # grade afterwards); ignored by every other mode.
+                grade_settings=self._settings.grade,
+                effects_settings=self._settings.effects,
+                luts_dir=paths.luts_dir(),
             )
         except Exception as error:  # noqa: BLE001 - the UI is the error handler
             self.failed.emit(str(error))
             return
         self.finished.emit(result)
+
+
+class SaveWorker(QObject):
+    """Renders and writes one or more result files off the UI thread.
+
+    A full-resolution Ultra save is grade + effects + PNG encode on a 600 MP
+    array — several seconds that froze the window when it ran inline. Each job is
+    ``(label, action)`` where ``action`` writes one or more files and returns the
+    paths it wrote (a Path or a list). Actions must touch no Qt objects
+    (grade/effects/save_image are all pure), so they are safe to run here.
+    """
+
+    progress = Signal(str)
+    finished = Signal(object)  # list[Path] actually written
+    failed = Signal(str)
+
+    def __init__(self, jobs: list) -> None:
+        super().__init__()
+        self._jobs = jobs
+
+    def run(self) -> None:
+        saved: list[Path] = []
+        try:
+            for label, action in self._jobs:
+                self.progress.emit(label)
+                written = action()
+                if isinstance(written, (list, tuple)):
+                    saved.extend(Path(p) for p in written)
+                elif written is not None:
+                    saved.append(Path(written))
+        except Exception as error:  # noqa: BLE001 - the UI is the error handler
+            self.failed.emit(str(error))
+            return
+        self.finished.emit(saved)
 
 
 class StyleWorker(QObject):
@@ -1172,6 +1240,7 @@ class BatchWorker(QObject):
         engine: DepthEngine,
         destination: Path,
         skip_existing: bool,
+        save_format: str | None = None,
     ) -> None:
         super().__init__()
         self._images = images
@@ -1179,6 +1248,7 @@ class BatchWorker(QObject):
         self._engine = engine
         self._destination = destination
         self._skip = skip_existing
+        self._save_format = save_format
         self._stop = False
 
     def stop(self) -> None:
@@ -1193,6 +1263,7 @@ class BatchWorker(QObject):
                 self._destination,
                 grade_settings=self._settings.grade,
                 skip_existing=self._skip,
+                save_format=self._save_format,
                 progress=self.progress.emit,
                 should_stop=lambda: self._stop,
             ):
@@ -1258,6 +1329,23 @@ class BatchDialog(QDialog):
         dest_row.addWidget(self.pick_dest)
         dest_row.addWidget(self.dest_label, 1)
         layout.addLayout(dest_row)
+
+        format_row = QHBoxLayout()
+        format_row.addWidget(QLabel("Save as"))
+        self.format_box = QComboBox()
+        # data is the extension (no dot), or None for "match the source".
+        self.format_box.addItem("Same as source (PNG, or JPEG XR for HDR)", None)
+        self.format_box.addItem("PNG (16-bit)", "png")
+        self.format_box.addItem("JPEG", "jpg")
+        self.format_box.addItem("TIFF (16-bit)", "tif")
+        self.format_box.addItem("JPEG XR (HDR)", "jxr")
+        self.format_box.setToolTip(
+            "The file type every converted image is written as. 'Same as source' "
+            "keeps PNG for SDR images and JPEG XR for HDR ones."
+        )
+        format_row.addStretch(1)
+        format_row.addWidget(self.format_box)
+        layout.addLayout(format_row)
 
         self.recursive = QCheckBox("Include sub-folders")
         self.skip_existing = QCheckBox("Skip images already converted")
@@ -1355,6 +1443,7 @@ class BatchDialog(QDialog):
             self._window.engine,
             self.destination,
             self.skip_existing.isChecked(),
+            self.format_box.currentData(),
         )
         self.preview.setVisible(True)
         self.preview.clear()
@@ -3098,7 +3187,73 @@ class MainWindow(QMainWindow):
         row.addWidget(sep)
         row.addSpacing(6)
         row.addWidget(self.view_grade)
+
+        # Ultra only: open the full-resolution image (the ~30000 px one) in a
+        # zoomable viewer. Hidden until an Ultra result exists. It is a separate,
+        # isolated view rather than an inline swap of the compare wipe, so it can
+        # never destabilise the before/after; a strided read keeps it low-RAM.
+        # Given its own accent style and the real pixel size on the label so it
+        # stands out from the plain view chips — it was easy to miss otherwise.
+        full_sep = QFrame()
+        full_sep.setObjectName("viewBarSep")
+        full_sep.setFixedWidth(1)
+        row.addSpacing(6)
+        row.addWidget(full_sep)
+        row.addSpacing(6)
+        self.view_full = QPushButton("⤢  Full resolution")
+        self.view_full.setObjectName("fullResChip")
+        self.view_full.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.view_full.setToolTip(
+            "View the full super-resolution image (far larger than the preview). "
+            "Opens a zoomable viewer; the preview here stays at the original size."
+        )
+        self.view_full.clicked.connect(self._view_ultra_full)
+        self.view_full.setVisible(False)
+        row.addWidget(self.view_full)
         return bar
+
+    def _view_ultra_full(self) -> None:
+        """Open the streamed Ultra BigTIFF in a zoomable viewer (low-RAM strided read)."""
+        if self.result is None or self.result.ultra_full_path is None:
+            return
+        path = Path(self.result.ultra_full_path)
+        if not path.is_file():
+            QMessageBox.information(
+                self, "Full-resolution image",
+                "The full-resolution file is no longer on disk. Convert again, or "
+                "open the saved file directly.",
+            )
+            return
+        try:
+            import tifffile
+
+            arr = tifffile.memmap(str(path), mode="r")
+            full_h, full_w = arr.shape[:2]
+            # Strided subsample reads only the sampled pixels through the memmap,
+            # so a 600 MP file previews without loading gigabytes.
+            step = max(1, int(max(full_h, full_w) / 4096))
+            small = np.array(arr[::step, ::step])
+            del arr
+        except Exception as error:  # noqa: BLE001
+            QMessageBox.warning(self, "Full-resolution image", f"Could not open it:\n{error}")
+            return
+        if small.dtype == np.uint16:
+            small_u8 = (small >> 8).astype(np.uint8)
+        else:
+            small_u8 = np.clip(small, 0, 255).astype(np.uint8)
+
+        from .widgets import ImageView
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Super-resolution — {full_w}×{full_h}")
+        dialog.setStyleSheet(STYLE)
+        dialog.resize(1100, 750)
+        lay = QVBoxLayout(dialog)
+        lay.setContentsMargins(0, 0, 0, 0)
+        view = ImageView()
+        view.set_image_u8(small_u8, caption=f"{full_w}×{full_h} · scroll to zoom")
+        lay.addWidget(view)
+        dialog.exec()
 
     def _grade_panel(self) -> QWidget:
         panel = QWidget()
@@ -3494,8 +3649,12 @@ class MainWindow(QMainWindow):
         return not self.settings.effects.is_neutral
 
     def _detail_active(self) -> bool:
-        # Only Preserve is a display-stage op; Boost is a conversion-time mode.
-        return self.settings.detail.mode == "preserve"
+        # No detail mode is a display-stage op any more: Preserve (the only one
+        # that lifted source detail live) was retired, and Boost/Ultra are
+        # conversion-time modes that run inside the pipeline. Kept as a hook so
+        # the preview's post-DLSS plumbing (_apply_preserve, _post_active) stays
+        # intact and simply short-circuits.
+        return False
 
     def _post_active(self) -> bool:
         """Whether any post-DLSS display stage (detail or effects) is on."""
@@ -3687,6 +3846,16 @@ class MainWindow(QMainWindow):
         user set to inspect something.
         """
         if self.result is None or self._preview_after_linear is None:
+            return
+
+        if getattr(self.result, "look_baked", False):
+            # Ultra baked the grade + effects into the result at Convert time, so
+            # show it as-is — applying the grade again here would double it, and
+            # the sliders no longer change this result (re-Convert to change it).
+            before_u8 = self._preview_before_u8 if fast else self._full_before_u8
+            baked = self._preview_after if fast else np.clip(self.result.enhanced, 0.0, 1.0)
+            after_u8 = (np.clip(baked, 0.0, 1.0) * 255.0).astype(np.uint8)
+            self.wipe.set_images_u8(before_u8, after_u8, keep_view=not new)
             return
 
         if fast:
@@ -4102,9 +4271,29 @@ class MainWindow(QMainWindow):
         replay_btn.clicked.connect(self.replay_onboarding)
         help_card.add(replay_btn)
 
+        # -- Credits & licences --
+        from . import upscale as _upscale
+
+        credits = ModuleCard("Credits & licences")
+        credit_lines = [
+            "Depth: Depth Anything V2 (Small bundled) — Apache-2.0.",
+        ]
+        credit_lines += [m.attribution for m in _upscale.MODELS.values()]
+        credit_lines += [
+            "Colour/neural composition: RenoDX DLSS 5 add-on by clshortfuse.",
+            "Runtimes: ONNX Runtime (MIT), tifffile (BSD-3), OpenCV, PySide6/Qt.",
+            "nvngx_dlss / nvngx_dlssnr are NVIDIA's own files, supplied by you; "
+            "not distributed with this app.",
+        ]
+        credits_label = QLabel("\n\n".join(credit_lines))
+        credits_label.setObjectName("hint")
+        credits_label.setWordWrap(True)
+        credits.add(credits_label)
+
         # Two balanced columns, so nothing — a slider especially — sprawls the
         # full width of the window.
         left.addWidget(appearance)
+        left.addWidget(credits)
         left.addStretch(1)
         right.addWidget(runtime_grp)
         right.addWidget(help_card)
@@ -4218,6 +4407,8 @@ class MainWindow(QMainWindow):
         row.addWidget(QLabel("Passes"))
         self.frames = QSpinBox()
         self.frames.setRange(1, 32)
+        # Room for the value plus the 18 px arrow buttons so nothing clips.
+        self.frames.setMinimumWidth(84)
         self.frames.setValue(self.settings.evaluation.frames)
         self.frames.setToolTip(
             "DLSS is temporal. One pass leaves its accumulator empty; the result "
@@ -4233,6 +4424,8 @@ class MainWindow(QMainWindow):
         size_row.addWidget(QLabel("Max size"))
         self.max_edge = QComboBox()
         self.max_edge.setEditable(True)
+        # Wide enough for "3840 px" plus the chevron so the value never clips.
+        self.max_edge.setMinimumWidth(110)
         for choice in MAX_EDGE_CHOICES:
             self.max_edge.addItem(f"{choice} px", choice)
         current = self.settings.evaluation.max_edge
@@ -4270,24 +4463,25 @@ class MainWindow(QMainWindow):
         return panel
 
     def _detail_group(self) -> QWidget:
-        """Detail recovery — give back the fine texture DLAA softens.
+        """Detail recovery — win back the fine texture DLAA softens.
 
-        Preserve is instant and lives here with the neural controls because it is
-        about the *quality* of the result, not an optional look. It re-injects
-        the source photo's own fine detail onto the DLSS output, so brick, fabric
-        and mesh stay crisp while the neural relighting is kept.
+        Two ways, both by running the neural pass at a larger size so its
+        fixed-scale softening covers less of each real detail: Boost does one
+        auto-sized supersampled pass, Ultra Detail goes further by tiling. Both
+        are conversion-time and size themselves — there is nothing to tune, so
+        the card is just the choice and a line saying what it does.
         """
         group = ModuleCard("Detail", tag="New")
         self.detail_card = group
         group.setToolTip(
             "DLAA is an anti-aliaser: on a photo it smooths genuine fine texture "
-            "(brick, perforations, railings). Preserve puts that detail back by "
-            "lifting the source's own high-frequency band onto the result — the "
-            "real detail, not a sharpen, so it cannot halo."
+            "(brick, perforations, railings). Boost and Ultra Detail win it back "
+            "by running the neural pass at a larger size, then delivering at the "
+            "original size — sharper on renders and textured photos."
         )
         d_layout = group.body
 
-        modes = [("Off", "off"), ("Preserve", "preserve"), ("Boost", "boost")]
+        modes = [("Off", "off"), ("Boost", "boost"), ("Ultra Detail", "ultra")]
         current = next(
             (i for i, (_, data) in enumerate(modes) if data == self.settings.detail.mode),
             0,
@@ -4295,64 +4489,83 @@ class MainWindow(QMainWindow):
         self.detail_mode = SegmentedControl(modes, current=current)
         self.detail_mode.setToolTip(
             "Off — the plain DLSS result.\n\n"
-            "Preserve — re-inject the source's real fine detail (instant, native "
-            "resolution, no halos). The right default for renders and textured "
-            "photos.\n\n"
-            "Boost — supersample: run DLSS at 2×/4×/8× the size, crispened, "
-            "then downscale. Sharper still on renders, but slow (many more "
-            "pixels) and it takes effect on the next Convert, not live."
+            "Boost — one supersampled pass, sized automatically to the largest a "
+            "single evaluation allows for your image and card. Sharper on renders; "
+            "slower, and it applies on the next Convert.\n\n"
+            "Ultra Detail — supersamples further and processes the image in "
+            "overlapping tiles, so detail goes past what one pass can hold. The "
+            "slowest mode; sizes itself to your card's memory."
         )
         self.detail_mode.changed.connect(self._detail_mode_changed)
         d_layout.addWidget(self.detail_mode)
 
-        self.detail_amount = SliderRow(
-            "Amount",
-            self.settings.detail.amount,
-            self._detail_amount_setter,
-            "Preserve: how much source detail to blend back (0 = plain DLSS, "
-            "1 = full detail).\nBoost: strength of the pre-DLSS crispen.",
-            maximum=1.0,
-            minimum=0.0,
+        # AI upscale (Boost + Ultra): run a real SR model before DLSS so the
+        # enlarge reconstructs texture instead of interpolating it. Shown for
+        # Boost/Ultra only. Falls back to Lanczos if the model is not installed.
+        from . import upscale as _upscale
+
+        self.detail_sr_row = QWidget()
+        sr_row = QHBoxLayout(self.detail_sr_row)
+        sr_row.setContentsMargins(0, 0, 0, 0)
+        self.detail_sr_enabled = QCheckBox("AI upscale")
+        self.detail_sr_enabled.setChecked(bool(self.settings.detail.sr_enabled))
+        self.detail_sr_enabled.setToolTip(
+            "Reconstruct real detail with a super-resolution model before DLSS, "
+            "instead of a plain Lanczos enlarge. Its texture is grafted back after "
+            "DLSS so anti-aliasing cannot erase fine detail. Runs on your GPU "
+            "(DirectML). If the model is not installed it falls back to Lanczos."
         )
-        d_layout.addWidget(self.detail_amount)
-
-        # Boost-only: how hard to push it. "Extra sharpness" instead of the raw
-        # 2×/4×/8× multiplier - the number is an implementation detail, and the
-        # levels that would blow past the hardware texture limit are disabled by
-        # _sync_boost_guard rather than left to fail mid-conversion.
-        # Wrapped in a container widget (not a bare layout) so the whole row can
-        # be hidden when Boost is not the active mode — a greyed control here read
-        # to people as a broken button ("why is it there if it does nothing").
-        self.detail_super_row = QWidget()
-        ss_row = QHBoxLayout(self.detail_super_row)
-        ss_row.setContentsMargins(0, 0, 0, 0)
-        self.detail_super_label = QLabel("Extra sharpness")
-        ss_row.addWidget(self.detail_super_label)
-        self.detail_supersample = QComboBox()
-        for factor in DETAIL_BOOST_FACTORS:
-            self.detail_supersample.addItem(BOOST_LEVEL_LABELS[factor], factor)
-        self.detail_supersample.setToolTip(
-            "How much sharper Boost pushes. Higher runs DLSS at a larger size "
-            "before shrinking it back, so it is crisper but slower. Levels that "
-            "would not fit at the current Max size are greyed out."
+        self.detail_sr_enabled.toggled.connect(self._detail_sr_toggled)
+        sr_row.addWidget(self.detail_sr_enabled)
+        self.detail_sr_model = QComboBox()
+        for key, model in _upscale.MODELS.items():
+            self.detail_sr_model.addItem(model.name, key)
+        sel = self.detail_sr_model.findData(self.settings.detail.sr_model)
+        self.detail_sr_model.setCurrentIndex(sel if sel >= 0 else 0)
+        self.detail_sr_model.setToolTip(
+            "The super-resolution model, downloaded on first use (credited in "
+            "Settings). Reconstructs real detail before DLSS."
         )
-        ss_idx = self.detail_supersample.findData(self.settings.detail.supersample)
-        self.detail_supersample.setCurrentIndex(ss_idx if ss_idx >= 0 else 0)
-        self.detail_supersample.currentIndexChanged.connect(self._detail_super_changed)
-        ss_row.addStretch(1)
-        ss_row.addWidget(self.detail_supersample)
-        d_layout.addWidget(self.detail_super_row)
+        self.detail_sr_model.currentIndexChanged.connect(self._detail_sr_model_changed)
+        # With a single model the picker is noise; show it only when there's a choice.
+        self.detail_sr_model.setVisible(len(_upscale.MODELS) > 1)
+        sr_row.addStretch(1)
+        sr_row.addWidget(self.detail_sr_model)
+        d_layout.addWidget(self.detail_sr_row)
 
-        # A second, quieter line for the guard message ("Max needs a smaller Max
-        # size…"), kept separate from the mode explainer so the two do not fight
-        # over one label.
-        self.detail_guard = QLabel()
-        self.detail_guard.setObjectName("hint")
-        self.detail_guard.setWordWrap(True)
-        d_layout.addWidget(self.detail_guard)
+        # Ultra-only: the output size multiplier. Boost stays automatic, but in
+        # Ultra the output size is the whole point (only tiles hit the GPU, so the
+        # merged image is bounded by RAM, not the texture limit), so it is exposed.
+        # Wrapped in a container so the row hides entirely outside Ultra.
+        self.detail_ultra_row = QWidget()
+        ultra_row = QHBoxLayout(self.detail_ultra_row)
+        ultra_row.setContentsMargins(0, 0, 0, 0)
+        ultra_row.addWidget(QLabel("Size"))
+        self.detail_ultra_factor = QComboBox()
+        for label, data in (("2×", 2.0), ("4×", 4.0), ("8×", 8.0), ("Max", 0.0)):
+            self.detail_ultra_factor.addItem(label, data)
+        self.detail_ultra_factor.setToolTip(
+            "How much larger Ultra renders. Only the tiles touch the GPU, so the "
+            "merged image is limited by system RAM, not the texture limit — Max "
+            "goes as large as your RAM allows. The full-size image is saved as-is "
+            "(BigTIFF); it is not downscaled."
+        )
+        idx = self.detail_ultra_factor.findData(float(self.settings.detail.ultra_factor))
+        self.detail_ultra_factor.setCurrentIndex(idx if idx >= 0 else 1)  # default 4×
+        self.detail_ultra_factor.currentIndexChanged.connect(self._detail_ultra_factor_changed)
+        ultra_row.addStretch(1)
+        ultra_row.addWidget(self.detail_ultra_factor)
+        d_layout.addWidget(self.detail_ultra_row)
 
-        # A one-line explainer under the controls, like the mockup's card copy —
-        # updated to whichever mode is selected.
+        # Live "result: W×H" line for the chosen multiplier and loaded image.
+        self.detail_ultra_size = QLabel()
+        self.detail_ultra_size.setObjectName("hint")
+        self.detail_ultra_size.setWordWrap(True)
+        d_layout.addWidget(self.detail_ultra_size)
+
+        # A one-line explainer under the control, updated to the selected mode.
+        # Boost sizes itself from the image, the D3D12 texture limit and free
+        # VRAM, so it has no level, slider or guard.
         self.detail_hint = QLabel()
         self.detail_hint.setObjectName("hint")
         self.detail_hint.setWordWrap(True)
@@ -4363,113 +4576,94 @@ class MainWindow(QMainWindow):
 
     _DETAIL_HINTS = {
         "off": "The plain DLSS result — no detail recovery.",
-        "preserve": "Preserve keeps the source's own fine texture — brick, mesh "
-                    "and fabric stay crisp — while keeping the neural relight. "
-                    "Instant, and the right default.",
-        "boost": "Boost runs DLSS larger than the image, then shrinks it back for "
-                 "extra crispness. Slower, and it applies on the next Convert.",
+        "boost": "Boost runs one supersampled pass at an automatic size, then "
+                 "delivers at the original size for extra crispness. Slower, and "
+                 "it applies on the next Convert.",
+        "ultra": "Ultra Detail supersamples further and merges overlapping tiles, "
+                 "for detail beyond a single pass. The slowest mode; it sizes "
+                 "itself to your card and applies on the next Convert.",
     }
 
-    def _sync_boost_guard(self) -> None:
-        """Offer only the sharpness levels that fit the current Max size.
-
-        Boost runs at (Max size × level), and a D3D12 texture cannot exceed
-        D3D12_MAX_TEXTURE_DIMENSION on a side, so a high level at a high Max size
-        overflows - the opaque failure a user hit as an add-on init error. Here
-        the overflowing levels are simply disabled, the selection is stepped down
-        to the best that fits, and a plain line explains it. Above 8192 px even
-        the smallest level cannot fit, which is the "Boost needs Max size 8192 px
-        or smaller" case.
-        """
-        if not hasattr(self, "detail_supersample"):
-            return
-        max_edge = int(self.settings.evaluation.max_edge)
-        ceiling = max_boost_factor(max_edge)  # 0 when nothing fits
-        active = self.settings.detail.mode == "boost"
-
-        # Enable/disable each level by whether it fits, without firing the change
-        # handler while we reshape the list.
-        self.detail_supersample.blockSignals(True)
-        model = self.detail_supersample.model()
-        for i in range(self.detail_supersample.count()):
-            factor = self.detail_supersample.itemData(i)
-            fits = ceiling > 0 and factor <= ceiling
-            model.item(i).setEnabled(fits)
-
-        # Only clamp the stored level and speak up while Boost is the live mode.
-        # Doing it when Boost is off would silently change a setting the user
-        # cannot see the effect of; the guard re-runs the moment Boost is chosen.
-        message = ""
-        if active:
-            if ceiling == 0:
-                # Nothing fits: Boost can't supersample at this Max size.
-                message = (
-                    f"Boost needs Max size 8192 px or smaller — at {max_edge} px "
-                    "it would exceed the GPU's texture limit."
-                )
-            else:
-                chosen = int(self.settings.detail.supersample)
-                if chosen > ceiling:
-                    # Step the stored setting down to the best that fits, say so.
-                    self.settings.detail.supersample = ceiling
-                    self.settings.save(paths.settings_path())
-                    idx = self.detail_supersample.findData(ceiling)
-                    if idx >= 0:
-                        self.detail_supersample.setCurrentIndex(idx)
-                    message = (
-                        f"{BOOST_LEVEL_LABELS.get(chosen, 'That level')} needs a "
-                        f"smaller Max size — using {BOOST_LEVEL_LABELS[ceiling]} "
-                        f"at {max_edge} px."
-                    )
-        self.detail_supersample.blockSignals(False)
-        if hasattr(self, "detail_guard"):
-            self.detail_guard.setText(message)
-            self.detail_guard.setVisible(bool(message))
-
     def _sync_detail_controls(self) -> None:
-        """Show the sharpness row only in Boost, grey Amount in Off, set the
-        card's explainer to match the selected mode, and re-run the Boost guard."""
+        """Match the card to the selected mode: explainer, SR row, Ultra size row."""
         mode = self.settings.detail.mode
-        is_boost = mode == "boost"
-        # Extra sharpness is Boost-only: hide the whole row for Off/Preserve so
-        # there is no greyed control to read as broken.
-        self.detail_super_row.setVisible(is_boost)
-        # Amount drives Preserve's blend and Boost's crispen; it does nothing in
-        # Off, so grey it there rather than leaving a live-looking slider that
-        # changes nothing (reported as "Amount has no effect with Off").
-        self.detail_amount.setEnabled(mode != "off")
+        is_ultra = mode == "ultra"
+        if hasattr(self, "detail_sr_row"):
+            # AI upscale applies to both enlarge modes; hidden for Off.
+            self.detail_sr_row.setVisible(mode in ("boost", "ultra"))
+            self.detail_sr_model.setEnabled(self.detail_sr_enabled.isChecked())
+        if hasattr(self, "detail_ultra_row"):
+            self.detail_ultra_row.setVisible(is_ultra)
+            self.detail_ultra_size.setVisible(is_ultra)
+        if is_ultra:
+            self._update_ultra_size_label()
         if hasattr(self, "detail_hint"):
             self.detail_hint.setText(self._DETAIL_HINTS.get(mode, ""))
-        self._sync_boost_guard()
+
+    def _detail_sr_toggled(self, on: bool) -> None:
+        self.settings.detail.sr_enabled = bool(on)
+        if hasattr(self, "detail_sr_model"):
+            self.detail_sr_model.setEnabled(on)
+        if on:
+            # AI upscale reconstructs detail before DLSS, so sub-pixel jitter (a
+            # temporal AA trick) mostly adds softening here, and a couple of DLSS
+            # passes is plenty. Set both to sensible values; the widgets' own
+            # handlers persist them. The user can still change them afterwards.
+            if hasattr(self, "jitter"):
+                self.jitter.setChecked(False)
+            if hasattr(self, "frames"):
+                self.frames.setValue(2)
+        self.settings.save(paths.settings_path())
+
+    def _detail_sr_model_changed(self, _index: int) -> None:
+        self.settings.detail.sr_model = self.detail_sr_model.currentData() or "realesr-general-x4v3"
+        self.settings.save(paths.settings_path())
+
+    def _update_ultra_size_label(self) -> None:
+        """Show the resolution and tile count the chosen Ultra size will produce.
+
+        Runs the same sizing the pipeline will (``tiling.auto_ultra`` + plan), so
+        the preview is exactly what Convert does — including 'Max', which is
+        resolved here against current free RAM/VRAM rather than left vague.
+        """
+        if not hasattr(self, "detail_ultra_size"):
+            return
+        prepared = getattr(self, "prepared", None)
+        if prepared is None:
+            self.detail_ultra_size.setText("Open an image to see the resulting size.")
+            return
+        requested = float(self.detail_ultra_factor.currentData() or 0.0)
+        h, w = prepared.source.shape[:2]
+        factor, tile_max, overlap = tiling.auto_ultra(
+            w, h,
+            requested_factor=requested,
+            ram_free=hardware.query_system_ram(),
+            vram_free=(lambda v: v.free_bytes if v else None)(hardware.query_nvidia_vram()),
+            max_factor=self.settings.detail.ultra_max_factor,
+        )
+        bw, bh = max(w, int(round(w * factor))), max(h, int(round(h * factor)))
+        n_tiles = len(tiling.plan_tiles(bw, bh, tile_max, overlap))
+        mp = (bw * bh) / 1_000_000
+        tiles_word = "tile" if n_tiles == 1 else "tiles"
+        prefix = "Max → " if requested <= 0.0 else ""
+        clamped = requested > 0.0 and factor < requested - 1e-3
+        note = " (limited by free RAM)" if clamped else ""
+        self.detail_ultra_size.setText(
+            f"{prefix}Result: {bw}×{bh} ({mp:.0f} MP) in {n_tiles} {tiles_word}"
+            f"{note}. Saved full size — pick PNG, JPEG or TIFF on Save."
+        )
 
     def _detail_mode_changed(self, _index: int) -> None:
         self.settings.detail.mode = self.detail_mode.current_data() or "off"
         self.settings.save(paths.settings_path())
         self._sync_detail_controls()
-        self._detail_redraw()
+        # Boost/Ultra are conversion-time modes that apply on the next Convert;
+        # there is nothing to redraw live.
 
-    def _detail_super_changed(self, _index: int) -> None:
-        self.settings.detail.supersample = int(self.detail_supersample.currentData() or 2)
+    def _detail_ultra_factor_changed(self, _index: int) -> None:
+        self.settings.detail.ultra_factor = float(self.detail_ultra_factor.currentData() or 0.0)
         self.settings.save(paths.settings_path())
-        # Boost is a conversion-time mode, so this takes effect on the next
-        # Convert; there is nothing to redraw live.
-
-    def _detail_amount_setter(self, value: float):
-        self.settings.detail.amount = value
-        self.settings.save(paths.settings_path())
-        self._detail_redraw()
-
-    def _detail_redraw(self) -> None:
-        """Repaint the result and the effects preview on the grade timers.
-
-        Preserve is a cheap post-DLSS pass like the grade, so it rides the same
-        coalesced fast/sharp beat — the wipe stays responsive while the amount
-        slider drags, and sharpens once it settles.
-        """
-        if self._view in ("result", "styles"):
-            self._grade_timer.start()
-            self._grade_full_timer.start()
-        self._effects_preview_timer.start()
+        self._update_ultra_size_label()
 
 
     # -- sequence page -------------------------------------------------------
@@ -5190,10 +5384,11 @@ class MainWindow(QMainWindow):
             ),
             onboarding.TourStep(
                 "Detail",
-                "Preserve restores the source's real fine texture after DLSS. Boost "
-                "instead runs DLSS at the selected 2×, 4× or 8× supersample size, "
-                "then downscales — sharper, but much slower and limited by the "
-                "GPU's currently available VRAM.",
+                "Boost runs DLSS at an automatic supersampled size, then delivers "
+                "at the original size for extra crispness. Ultra Detail goes "
+                "further, rendering in overlapping tiles and merging them into a "
+                "genuinely huge image, saved at full size. Turn on AI upscale to "
+                "reconstruct real detail. Both apply on the next Convert.",
                 self.detail_card,
             ),
             onboarding.TourStep(
@@ -5518,6 +5713,9 @@ class MainWindow(QMainWindow):
 
     def _depth_ready(self, prepared: pipeline.Prepared) -> None:
         self.prepared = prepared
+        # A real image size is now known, so the Ultra "result: W×H" line can show
+        # actual pixels instead of the placeholder.
+        self._update_ultra_size_label()
         self._depth_teardown()
         self.show_view("depth")
         self.statusBar().showMessage(
@@ -5546,9 +5744,6 @@ class MainWindow(QMainWindow):
         if value == self.settings.evaluation.max_edge:
             return
         self.settings.evaluation.max_edge = value
-        # Max size is the ceiling Boost multiplies, so a change here can make the
-        # current sharpness level fit or overflow. Re-run the guard.
-        self._sync_boost_guard()
         # Depth is estimated on the fitted image, so a different size means the
         # cached depth is the wrong shape and has to be redone.
         self._depth_settings_changed()
@@ -5760,6 +5955,14 @@ class MainWindow(QMainWindow):
         self._update_effects_preview()
         self.save_button.setEnabled(True)
         self.feedback_button.setEnabled(True)
+        # The full-resolution viewer chip is meaningful only for an Ultra result.
+        # Put the real pixel size on it so it reads as "there's a huge image here"
+        # rather than a generic button that blends into the view chips.
+        if hasattr(self, "view_full"):
+            self.view_full.setVisible(result.has_full)
+            if result.has_full and result.ultra_full_size is not None:
+                fw, fh = result.ultra_full_size
+                self.view_full.setText(f"⤢  View full resolution  {fw}×{fh}")
         # The reveal (convert or preview) lands and dissipates into the result,
         # then switches to the result view itself (_on_reveal_done). If none is
         # running, show the result straight away.
@@ -5773,6 +5976,16 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Preview — intensity {neural.intensity:.2f}, skin {neural.skin:.2f}, "
                 f"tone {neural.local_tone:.2f}, structure {neural.structure:.2f}"
+            )
+        elif result.has_full and result.ultra_full_size is not None:
+            # Ultra streamed an image far larger than the preview shows straight to
+            # scratch. Say so plainly, with the pixel size, so it is obvious there
+            # is something to save — the preview alone looks native-sized.
+            fw, fh = result.ultra_full_size
+            self.statusBar().showMessage(
+                f"Done — Ultra rendered {fw}×{fh} (on disk). The preview is "
+                "downscaled to fit; use Full-resolution… to view it, and Save "
+                "result to keep the full-size image."
             )
         else:
             self.statusBar().showMessage(
@@ -5798,65 +6011,211 @@ class MainWindow(QMainWindow):
     def save(self) -> None:
         if self.result is None:
             return
+        is_hdr = self.result.hdr
+        # The app's own output folder, not the home directory: a release build
+        # ships one, and defaulting anywhere else scatters results.
+        suggested = self.settings.last_output_dir or str(paths.output_dir())
+        stem = (self.image_path or Path("image")).stem
+        style = style_slug(self.settings.neural.style)
+        # An HDR result defaults to a format that can hold it. Offering PNG first
+        # would quietly tone map away the reason the source was opened as HDR.
+        ext = "jxr" if is_hdr else "png"
+        hdr_filters = "JPEG XR (*.jxr);;OpenEXR (*.exr);;"
+        sdr_filters = "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)"
+        filters = (hdr_filters + sdr_filters) if is_hdr else (sdr_filters + ";;" + hdr_filters.rstrip(";"))
+
+        if self.result.has_full:
+            # Ultra: the full-resolution image was streamed to scratch during the
+            # convert, so saving is just a fast move (no re-encode of a 600 MP
+            # image). Only the full-resolution image is written — a downscaled
+            # native copy was found to lose detail, so it is not saved. No size
+            # dialog (the size was the Ultra multiplier); the file is a BigTIFF.
+            assert self.result.ultra_full_path is not None
+            fw, fh = self.result.ultra_full_size or (0, 0)
+            # Tag the file with the long-edge in K so it is obvious how big it is,
+            # e.g. ..._ultra_33K.png. "ultra" (the mode), not "super_resolution".
+            kk = f"{round(max(fw, fh) / 1000)}K"
+            # PNG default (lossless, opens anywhere). TIFF is an instant move;
+            # PNG/JPEG re-encode the giant image on the fly for people who can't
+            # open a TIFF. JPEG is fastest/smallest but lossy.
+            default = str(Path(suggested) / f"{stem}_dlss5_{style}_ultra_{kk}.png")
+            chosen, _ = QFileDialog.getSaveFileName(
+                self, "Save Ultra Detail (full size)",
+                default,
+                "PNG (*.png);;JPEG (*.jpg);;TIFF — instant (*.tiff *.tif)",
+            )
+            if not chosen:
+                return
+            jobs = [(
+                f"Saving the {fw}×{fh} Ultra Detail image "
+                f"({Path(chosen).suffix.lstrip('.').upper()})…",
+                lambda: [self._save_ultra(Path(chosen))],
+            )]
+            self._start_save(
+                jobs,
+                lambda saved: f"Saved {Path(chosen).name} ({fw}×{fh}, Ultra Detail)",
+            )
+            return
+
+        # Every other mode: choose an output size, then save one file.
         height, width = self.result.enhanced.shape[:2]
         sizer = ExportDialog(self, (width, height))
         if sizer.exec() != QDialog.Accepted:
             return
         target = sizer.chosen()
-
-        # The app's own output folder, not the home directory: a release build
-        # ships one, and defaulting anywhere else scatters results.
-        suggested = self.settings.last_output_dir or str(paths.output_dir())
-        stem = (self.image_path or Path("image")).stem
-        # Name the size in the file when it is not the native one, so a folder
-        # of exports at three sizes is still readable a week later.
-        if target != (width, height):
-            stem = f"{stem}_{target[0]}x{target[1]}"
-        # An HDR result defaults to a format that can hold it. Offering PNG
-        # first would quietly tone map away the entire reason the source was
-        # opened as HDR.
-        is_hdr = self.result.hdr
-        style = style_slug(self.settings.neural.style)
-        default = str(Path(suggested) / f"{stem}_dlss5_{style}.{'jxr' if is_hdr else 'png'}")
-        hdr_filters = "JPEG XR (*.jxr);;OpenEXR (*.exr);;"
-        sdr_filters = "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)"
-        filters = (hdr_filters + sdr_filters) if is_hdr else (sdr_filters + ";;" + hdr_filters.rstrip(";"))
+        # Name the size in the file when it is not the native one, so a folder of
+        # exports at three sizes is still readable a week later.
+        named = stem if target == (width, height) else f"{stem}_{target[0]}x{target[1]}"
+        default = str(Path(suggested) / f"{named}_dlss5_{style}.{ext}")
         chosen, _ = QFileDialog.getSaveFileName(self, "Save result", default, filters)
         if not chosen:
             return
-        try:
-            # Full resolution, not the preview the sliders were dragged against.
-            # Grade first, then resample: the grade is a per-pixel curve, and
-            # running it after an enlargement would apply it to interpolated
-            # pixels that the contrast S-curve then pushes apart again.
-            if is_hdr:
-                assert self.result.enhanced_linear is not None
-                image = grade.apply_linear(self.result.enhanced_linear, self.settings.grade)
-                # Effects at native, before the export resize — the same order
-                # the full-resolution preview uses, so a native-size save is
-                # pixel-for-pixel what was on screen. Range is kept for the .jxr.
-                image = self._hdr_linear_with_effects(image)
-                image = resample.resize_linear(image, *target)
-            else:
-                image = grade.apply(self.result.enhanced, self.settings.grade)
-                # Preserve and effects at native, before the export resize — the
-                # same order the full-resolution preview uses, so a native-size
-                # save is pixel-for-pixel what was on screen.
-                image = self._apply_preserve(
-                    image, np.clip(self.result.original, 0.0, 1.0).astype(np.float32)
-                )
-                if self._effects_active():
-                    image = effects.apply(image, self.settings.effects, paths.luts_dir())
-                image = resample.resize(image, *target)
-            pipeline.save_image(image, chosen, linear=is_hdr)
-        except (OSError, ValueError, RuntimeError) as error:
-            QMessageBox.warning(self, "Could not save", str(error))
-            return
-        self.settings.last_output_dir = str(Path(chosen).parent)
-        self.settings.save(paths.settings_path())
         kept = Path(chosen).suffix.lower() in hdr_mod.SUFFIXES
         note = "" if not is_hdr else (" (HDR kept)" if kept else " (tone mapped to SDR)")
-        self.statusBar().showMessage(f"Saved {Path(chosen).name}{note}")
+
+        def _write_single() -> Path:
+            # Full resolution, not the preview the sliders were dragged against.
+            image = self._finish_for_save(
+                self.result.enhanced, self.result.enhanced_linear, is_hdr, target
+            )
+            pipeline.save_image(image, chosen, linear=is_hdr)
+            return Path(chosen)
+
+        self._start_save(
+            [(f"Saving {Path(chosen).name}…", _write_single)],
+            lambda saved: f"Saved {Path(chosen).name}{note}",
+        )
+
+    def _start_save(self, jobs: list, done_message) -> None:
+        """Run save `jobs` on a worker thread behind a modal progress dialog.
+
+        The window stays responsive (the dialog animates) while grade/effects and
+        the encode run off-thread — the fix for the freeze a 600 MP Ultra save
+        caused. `done_message(saved_paths)` builds the status line on success.
+        """
+        dialog = QProgressDialog(jobs[0][0], "", 0, 0, self)
+        dialog.setWindowTitle("Saving")
+        # Window-modal, not application-modal: it blocks only this window while the
+        # save runs off-thread, and cannot wedge the whole app if teardown lags.
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setCancelButton(None)  # a half-written multi-file save is worse than waiting
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.show()
+
+        thread = QThread(self)
+        worker = SaveWorker(jobs)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(dialog.setLabelText)
+
+        def _dismiss() -> None:
+            # A QProgressDialog with no cancel button ignores close()/reject(), so
+            # it would stay up (and, modal, freeze input) forever. hide() bypasses
+            # that dialog logic and reliably takes it down; then it is destroyed.
+            dialog.hide()
+            dialog.deleteLater()
+            self._save_dialog = None
+
+        def _done(saved) -> None:
+            _dismiss()
+            self.save_button.setEnabled(True)
+            if saved:
+                self.settings.last_output_dir = str(Path(saved[0]).parent)
+                self.settings.save(paths.settings_path())
+            self.statusBar().showMessage(done_message(saved))
+
+        def _fail(message: str) -> None:
+            _dismiss()
+            self.save_button.setEnabled(True)
+            QMessageBox.warning(self, "Could not save", message)
+
+        worker.finished.connect(_done)
+        worker.failed.connect(_fail)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        # Hold references so neither is garbage-collected mid-save.
+        self._save_thread = thread
+        self._save_worker = worker
+        self._save_dialog = dialog
+        self.save_button.setEnabled(False)
+        thread.start()
+
+    def _finish_for_save(
+        self,
+        enhanced: np.ndarray,
+        enhanced_linear: np.ndarray | None,
+        is_hdr: bool,
+        target: tuple[int, int] | None,
+    ) -> np.ndarray:
+        """Grade + effects an enhanced image, optionally resizing to ``target``.
+
+        Grade first, then resample: the grade is a per-pixel curve, and running it
+        after an enlargement would apply it to interpolated pixels the contrast
+        S-curve then pushes apart again. Effects run at the pre-resize size, the
+        same order the full-resolution preview uses. ``target`` of None skips the
+        resize entirely — the path Ultra's full-resolution save takes, since the
+        merged image is deliberately larger than the resampler's 16384 px cap.
+        """
+        if is_hdr:
+            assert enhanced_linear is not None
+            image = grade.apply_linear(enhanced_linear, self.settings.grade)
+            image = self._hdr_linear_with_effects(image)
+            return image if target is None else resample.resize_linear(image, *target)
+        image = grade.apply(enhanced, self.settings.grade)
+        image = self._apply_preserve(
+            image, np.clip(self.result.original, 0.0, 1.0).astype(np.float32)
+        )
+        if self._effects_active():
+            image = effects.apply(image, self.settings.effects, paths.luts_dir())
+        return image if target is None else resample.resize(image, *target)
+
+    def _save_ultra(self, dest: Path) -> Path:
+        """Save the Ultra full-resolution image at ``dest``, in the chosen format.
+
+        The full-res image was streamed to scratch as a BigTIFF during the
+        convert. Saving as TIFF is a fast move (no re-encode of a 600 MP image);
+        saving as PNG or JPEG re-encodes on the fly (read the BigTIFF low-RAM and
+        write the requested type) so people who cannot open a TIFF still get a
+        usable file. Only the full-resolution image is written — a downscaled
+        native copy was found to lose detail. Assumes an Ultra result.
+        """
+        assert self.result is not None and self.result.ultra_full_path is not None
+        src = Path(self.result.ultra_full_path)
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            dest.unlink()
+        ext = dest.suffix.lower()
+
+        if ext in (".tif", ".tiff"):
+            # Fast path: just move the already-written BigTIFF.
+            shutil.move(str(src), str(dest))
+            self.result.ultra_full_path = dest  # view chip / re-save still resolve
+            return dest
+
+        # Re-encode to PNG/JPEG. Read the BigTIFF (uint16 RGB) — tifffile reads it
+        # without loading gigabytes of intermediates — and write the target type.
+        # The scratch BigTIFF is left in place so another format can be saved too.
+        import tifffile
+
+        from . import imaging
+
+        arr = tifffile.imread(str(src))
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        rgb = arr[:, :, :3]
+        if ext in (".jpg", ".jpeg"):
+            data = (rgb >> 8).astype(np.uint8) if rgb.dtype == np.uint16 else rgb.astype(np.uint8)
+        else:  # .png (16-bit) and anything else cv2 can encode
+            data = rgb
+        if not imaging.imwrite(dest, data[:, :, ::-1]):  # RGB -> BGR for cv2
+            raise OSError(f"Could not write {dest}")
+        return dest
 
     def diagnose(self) -> None:
         status = runtime.detect(self.settings.runtime_dir or None)

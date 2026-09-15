@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dlss5-converter"
-version = "0.3.1"
+version = "0.3.2"
 description = "Run NVIDIA's DLSS 5 neural renderer over still images."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -14,6 +14,10 @@ dependencies = [
   "numpy>=1.26,<3",
   "opencv-python-headless>=4.10,<5",
   "Pillow>=10.4,<12",
+  # BigTIFF streaming output for Ultra Detail: a 600 MP 16-bit result exceeds
+  # regular TIFF's 4 GB limit and cannot be held in RAM to encode, so it is
+  # written incrementally as BigTIFF. Pure Python + numpy, small, BSD-3.
+  "tifffile>=2024.1",
   # Depth runs on ONNX Runtime, not PyTorch - see onnx_depth.py - which is what
   # removes the 2.7 GB torch download. The shipped GPU path is DirectML: it runs
   # on any DirectX 12 GPU (NVIDIA/AMD/Intel) through the driver the user already

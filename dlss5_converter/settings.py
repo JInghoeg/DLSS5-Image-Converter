@@ -72,9 +72,15 @@ class NeuralSettings:
     preset: int = 0
     #: Default, Natural or Cinematic (index into NR_STYLES). Unlike the preset
     #: this is very much live: on a portrait, Cinematic moves the image about 50%
-    #: further from the source than Natural does at the same strengths. Default
-    #: (0) is the add-on's own starting look.
-    style: int = 0
+    #: further from the source than Natural does at the same strengths.
+    #:
+    #: We ship Cinematic (2), not the add-on's own Default (0), because Cinematic
+    #: is what reproduces the real in-game DLSS 5 look. Measured against genuine
+    #: Metro Exodus neural OFF/ON captures, Cinematic + max strengths matched the
+    #: game's face rework to ~5/255 in the skin region while Default stayed ~15
+    #: (i.e. barely changed from the untouched source). See the depth/neural
+    #: notes: the whole visible effect is colour + this style, at zero motion.
+    style: int = 2
     # Defaults are the maximum (2.0). The whole point of the tool is the neural
     # effect, so it opens fully on and obviously working — the commonest first
     # report on gentler defaults was "it does nothing" — and anyone who finds a
@@ -162,55 +168,73 @@ class EvaluationSettings:
 #: here; the field accepts anything, so an unusual workflow is not blocked.
 MAX_EDGE_CHOICES = (1920, 2560, 3840, 5120, 6144, 7680, 8192)
 
-#: Explicit Boost choices. Centralised so the UI and D3D12-limit guidance can
-#: never disagree about a multiplier the person can actually select.
-DETAIL_BOOST_FACTORS = (2, 4, 8)
-
-#: Plain names for the Boost factors, shown to users in place of "2×/4×/8×" -
-#: the multiplier is an implementation detail nobody outside the code needs.
-BOOST_LEVEL_LABELS = {2: "Standard", 4: "High", 8: "Max"}
-
-#: A D3D12 2D texture cannot exceed this on a side. Boost runs DLSS at
-#: (working size × factor), so the working size × factor must stay under it -
-#: this is the hard limit behind "Boost needs Max size 8192 px or smaller"
-#: (8192 × 2 = 16384). Mirrored in pipeline for the conversion-time check.
+#: A D3D12 2D texture cannot exceed this on a side. The single number behind the
+#: detail sizing lives in :mod:`tiling` (``tiling.D3D12_MAX_TEXTURE_DIMENSION``),
+#: which owns the auto Boost/Ultra maths; it is re-exported here so older imports
+#: and settings-facing code keep one name to refer to.
 D3D12_MAX_TEXTURE_DIMENSION = 16384
 
 
-def max_boost_factor(max_edge: int) -> int:
-    """Largest Boost factor whose working size fits the texture limit.
-
-    Returns 0 when even the smallest factor overflows (Max size above 8192),
-    which is the signal that Boost cannot run at this Max size at all.
-    """
-    allowed = [f for f in DETAIL_BOOST_FACTORS if max_edge * f <= D3D12_MAX_TEXTURE_DIMENSION]
-    return max(allowed) if allowed else 0
+#: The three Detail modes, in the order the UI shows them.
+DETAIL_MODES = ("off", "boost", "ultra")
 
 
 @dataclass
 class DetailSettings:
     """How fine detail is recovered after the neural pass.
 
-    DLAA softens genuine photographic texture; this decides how it is given
-    back. Flat and neutral-by-default (mode "off"), matching the other settings
-    groups. See detail.py for the maths and detail_engine.py for the AI step.
+    DLAA softens genuine photographic texture; this decides how much of it is
+    won back by processing at a larger size. Two modes do that, plus off:
+
+    - **Boost** supersamples the whole image to an *auto* size — as large as one
+      DLSS evaluation legally allows — crispens, runs the pass, and delivers at
+      the native size. There is no level and no slider: the factor is computed
+      from the image resolution, the D3D12 texture limit and free VRAM. See
+      :func:`tiling.auto_boost_factor` and pipeline.convert.
+
+    - **Ultra Detail** goes past the single-evaluation ceiling by supersampling
+      further and processing the result in overlapping, feather-merged tiles, so
+      the working resolution is bounded by texture size rather than by what one
+      pass can hold. See :mod:`tiling`.
+
+    Neutral by default (``off``), matching the other settings groups.
     """
 
-    #: "off"      — leave the DLSS result as-is.
-    #: "preserve" — re-inject the source's real high-frequency band (native
-    #:              resolution; the faithful, free default).
-    #: "boost"    — supersample: upscale the source, crispen, run DLSS at that
-    #:              size, then downscale. Slow, punchy, for high-end renders.
+    #: One of DETAIL_MODES. "preserve" from older builds is migrated to "off"
+    #: (the Preserve blend was retired when Boost became automatic).
     mode: str = "off"
-    #: Preserve: how much source detail to blend back, 0..1.
-    #: Boost: strength of the pre-DLSS crispen.
-    amount: float = 0.75
-    #: Gaussian radius of the high/low frequency split, in pixels.
-    radius: float = 2.0
-    #: Boost only: how far to supersample (2, 4 or 8). Higher processes the
-    #: square of the factor in pixels; it is not guaranteed to be sharper on
-    #: every source and is limited by live VRAM and the active DLSS runtime.
-    supersample: int = 4
+    #: Ultra only: how far to enlarge the source before tiling — the user's
+    #: multiplier. 0.0 means "Max" (as far as RAM and the save format allow).
+    #: Unlike Boost this is exposed, because in Ultra the *output size* is the
+    #: point: only the tiles ever become D3D12 textures, so the merged result is
+    #: bounded by RAM, not by the 16384 px texture limit.
+    ultra_factor: float = 4.0
+    #: Safety ceiling on the "Max" setting, so Max cannot try to allocate an
+    #: absurd merge no machine could hold. Not shown; tunable for testing.
+    ultra_max_factor: float = 16.0
+
+    #: AI super-resolution before DLSS (Boost and Ultra). When on, the enlarge
+    #: step is a learned SR model instead of Lanczos, so it *reconstructs*
+    #: texture rather than interpolating — the answer to "does it add detail?".
+    #: Off by default: the model downloads on first use, so it is opt-in rather
+    #: than a silent no-op or an unasked-for download. Falls back to Lanczos if
+    #: the model is unavailable.
+    sr_enabled: bool = False
+    #: Which SR model (a key in upscale.MODELS). Kept as a plain string so an
+    #: unknown value (older/newer build) degrades to the default, not a crash.
+    sr_model: str = "realesr-general-x4v3"
+    #: After DLSS, graft this fraction of the SR tile's real high-frequency band
+    #: back onto the result, so DLAA cannot erase fine texture (the architectural
+    #: case). 0 disables the guard; 1 fully restores the SR texture. See
+    #: detail.preserve_detail.
+    sr_regraft: float = 0.7
+
+    def __post_init__(self) -> None:
+        # Back-compat and hardening: a settings file written by an older build
+        # (mode "preserve") or hand-edited to nonsense must not put the pipeline
+        # into an unknown mode. Anything unrecognised falls back to off.
+        if self.mode not in DETAIL_MODES:
+            self.mode = "off"
 
     @property
     def is_neutral(self) -> bool:

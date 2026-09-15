@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from . import (
+    bigtiff,
     contract,
     detail,
     effects,
@@ -26,13 +27,12 @@ from . import (
     paths,
     runtime,
     sequence,
+    tiling,
     wic,
 )
 from .depth_engine import DepthEngine
 from .onnx_depth import OnnxDepthEngine
 from .settings import (
-    D3D12_MAX_TEXTURE_DIMENSION,
-    DETAIL_BOOST_FACTORS,
     AppSettings,
     style_slug,
 )
@@ -56,10 +56,26 @@ class Result:
     #: The tone mapping white point, shared with `original` so the wipe does
     #: not change exposure halfway across.
     white: float = 1.0
+    #: Ultra Detail only: the full-resolution image is streamed to this BigTIFF on
+    #: scratch during the convert (it is far too large to hold in RAM), and
+    #: `ultra_full_size` is its (width, height). Save moves this file to the user's
+    #: location; the toggle by the size readout views it. None in every other mode.
+    ultra_full_path: Path | None = None
+    ultra_full_size: tuple[int, int] | None = None
+    #: Ultra only: the grade + effects look was already baked into the source
+    #: before the pipeline (the full output is too large to grade afterwards), so
+    #: `enhanced` and the saved file already carry it and the app must NOT apply
+    #: grade/effects again on top.
+    look_baked: bool = False
 
     @property
     def hdr(self) -> bool:
         return self.enhanced_linear is not None
+
+    @property
+    def has_full(self) -> bool:
+        """Whether a distinct full-resolution Ultra image is available to save."""
+        return self.ultra_full_path is not None
 
 
 @dataclass
@@ -124,65 +140,296 @@ def prepare(
     )
 
 
-# D3D12_MAX_TEXTURE_DIMENSION is imported from settings at the top of this file:
-# it is defined there so the sidebar's Boost guard and this conversion-time
-# check share one number and cannot drift apart. (An API limit on a 2D texture
-# side, independent of VRAM capacity.)
+# Boost and Ultra both crispen the enlarged source before DLSS, so DLAA has a
+# sharper starting point to anti-alias rather than a bicubic-soft one. With the
+# level and slider retired (Boost is automatic now), these are fixed: a moderate
+# unsharp that measurably helps brick/mesh without haloing high-contrast edges.
+BOOST_CRISPEN_AMOUNT = 1.5
+BOOST_CRISPEN_RADIUS = 2.0
 
-#: Conservative working-set estimate for the four harness textures, NGX feature
-#: state and driver overhead. This is a preflight, not an allocator: D3D12 still
-#: makes the authoritative decision. The fixed part reflects measured NGX/add-on
-#: startup cost; the per-pixel part is deliberately above the harness's visible
-#: 24 B/px texture floor so hidden feature resources have room.
-_BOOST_FIXED_VRAM = int(1.25 * 1024**3)
-_BOOST_VRAM_PER_PIXEL = 32
-_BOOST_USABLE_FREE_FRACTION = 0.90
+#: Below this enlargement Boost is not worth the cost — the image is already
+#: near the single-evaluation ceiling — so Boost quietly runs at native size and
+#: says so, rather than paying for a 5% supersample.
+BOOST_MIN_FACTOR = 1.15
 
+#: Boost supersamples then shrinks back to native, and the area-average shrink
+#: softens the result a little. A gentle unsharp on the finished image restores
+#: the bite without haloing — deliberately light. (Ultra keeps its full-res
+#: output and never shrinks, so it does not need this.)
+BOOST_POST_SHARPEN_AMOUNT = 0.4
+BOOST_POST_SHARPEN_RADIUS = 1.2
 
-def _boost_target(factor: int, width: int, height: int) -> tuple[int, int]:
-    """Return the requested Boost dimensions, refusing only hard API limits."""
-    factor = max(1, int(factor))
-    target = (width * factor, height * factor)
-    if max(target) > D3D12_MAX_TEXTURE_DIMENSION:
-        largest = max(
-            candidate for candidate in (1, *DETAIL_BOOST_FACTORS)
-            if width * candidate <= D3D12_MAX_TEXTURE_DIMENSION
-            and height * candidate <= D3D12_MAX_TEXTURE_DIMENSION
-        )
-        raise RuntimeError(
-            f"Boost {factor}× would process at {target[0]}×{target[1]}, but "
-            f"D3D12 textures stop at {D3D12_MAX_TEXTURE_DIMENSION} pixels per "
-            f"side. Use {largest}× or lower, or reduce Max size first."
-        )
-    return target
+#: Ultra sharpens each tile right after DLSS, before the merge — the neural pass
+#: softens, and doing it per tile gets the "sharpen it in Photoshop afterwards"
+#: look without ever touching the full 30k image as one array. A touch stronger
+#: than Boost's since Ultra keeps full resolution; still gentle. The overlap
+#: feather hides any per-tile difference at the seams.
+ULTRA_TILE_SHARPEN_AMOUNT = 0.55
+ULTRA_TILE_SHARPEN_RADIUS = 1.0
 
 
-def _boost_vram_estimate(width: int, height: int) -> int:
-    """Estimated bytes needed by the native harness at one working size."""
-    return _BOOST_FIXED_VRAM + width * height * _BOOST_VRAM_PER_PIXEL
-
-
-def _preflight_boost_vram(width: int, height: int, say: Progress | None = None) -> None:
-    """Refuse a likely OOM from current free VRAM; unknown hardware may try."""
+def _free_vram_bytes() -> int | None:
+    """Free VRAM for the auto sizing, or None when there is no NVIDIA query."""
     info = hardware.query_nvidia_vram()
-    if info is None:
+    return info.free_bytes if info is not None else None
+
+
+def _evaluate_linear(
+    harness_exe: Path,
+    linear: np.ndarray,
+    inverse_depth: np.ndarray,
+    *,
+    settings: AppSettings,
+    scratch: Path,
+    out_path: Path,
+    colour_path: Path,
+    label: str,
+    progress: Progress | None,
+) -> np.ndarray:
+    """Run one DLSS evaluation over a linear image + its depth; return the result.
+
+    The single evaluation shared by every Detail mode: Off and Boost run it once
+    on the whole (native or supersampled) image, Ultra runs it once per tile.
+    ``label`` names the working size in the runtime-limit message so a tile
+    failure and a whole-image failure read differently.
+    """
+    height, width = linear.shape[:2]
+    plan = contract.build(
+        linear,
+        inverse_depth,
+        depth_contrast=settings.depth.contrast,
+        frames=settings.evaluation.frames,
+        jitter=settings.evaluation.jitter,
+        already_linear=True,
+    )
+    plane_paths = contract.write_planes(plan, scratch)
+
+    def write_colour(path: Path, offset: tuple[float, float]) -> None:
+        shifted = contract.shift_subpixel(linear, offset[0], offset[1])
+        plane = np.empty((height, width, 4), np.float16)
+        plane[..., :3] = shifted.astype(np.float16)
+        plane[..., 3] = np.float16(1.0)
+        plane.tofile(path)
+
+    try:
+        evaluator.run_frames(
+            harness_exe,
+            width=width,
+            height=height,
+            depth_path=plane_paths["depth"],
+            motion_path=plane_paths["motion"],
+            colour_path=colour_path,
+            out_path=out_path,
+            neural=settings.neural,
+            jitter=plan.jitter,
+            write_colour=write_colour,
+            progress=progress,
+        )
+    except evaluator.HarnessError as error:
+        # Current DLSS builds can reject a feature above their supported working
+        # resolution with InvalidParameter even when D3D12 and VRAM both allow
+        # the textures. Name the actual attempted size; a future runtime with a
+        # higher limit can try the same request unchanged.
+        if "CREATE_DLSS" in str(error) and "InvalidParameter" in str(error):
+            raise RuntimeError(
+                f"DLSS rejected the {width}×{height} {label} working size even "
+                "though it passed the VRAM and D3D12 checks. This is a runtime "
+                "feature limit, not out-of-memory (reference testing succeeds at "
+                "7680 px per side and rejects 10240). Reduce Max size, or use "
+                "Boost instead of Ultra."
+            ) from error
+        raise
+    return contract.read_output(out_path, width, height)
+
+
+#: The SR engine is cached across conversions: creating the DirectML session and
+#: compiling the model graph costs ~13 s, so rebuilding it every convert was most
+#: of the "hang". One engine per process, swapped only when the model changes.
+_SR_ENGINE = None
+
+
+def _make_upscale_engine(settings: AppSettings, say: Progress | None):
+    """An SR engine when enabled and its model loads, else None (Lanczos path).
+
+    Never raises: a missing/broken model must degrade to Lanczos, not stop a
+    conversion. The engine (and its compiled session) is cached across converts.
+    """
+    global _SR_ENGINE
+    if not settings.detail.sr_enabled:
+        return None
+    try:
+        from . import upscale
+
+        model = upscale.MODELS.get(settings.detail.sr_model)
+        if model is None:
+            raise ValueError(f"Unknown SR model {settings.detail.sr_model!r}.")
+        if _SR_ENGINE is not None and _SR_ENGINE.model_key == model.key:
+            return _SR_ENGINE  # reuse the already-compiled session
+        # Fetch on first use if it is not bundled/downloaded yet and has a URL.
+        if upscale.locate(model) is None and model.url:
+            upscale.download_model(model, progress=say)
         if say:
-            say("VRAM availability unavailable — letting D3D12 decide…")
-        return
-    estimated = _boost_vram_estimate(width, height)
-    usable = int(info.free_bytes * _BOOST_USABLE_FREE_FRACTION)
-    if say:
-        say(
-            f"VRAM preflight: about {estimated / 1024**3:.1f} GB needed, "
-            f"{usable / 1024**3:.1f} GB currently usable…"
+            say(f"Preparing the AI upscaler ({model.name})… first run compiles the model.")
+        engine = upscale.UpscaleEngine()
+        engine.load(model.key)
+        _SR_ENGINE = engine
+        if say:
+            say(f"AI upscaler ready: {model.name}")
+        return engine
+    except Exception as error:  # noqa: BLE001 - optional; degrade to Lanczos
+        if say:
+            say(f"AI upscaler unavailable ({error}); enlarging with Lanczos instead.")
+        return None
+
+
+def _enlarge_for_dlss(
+    source_srgb: np.ndarray,
+    inverse_depth: np.ndarray,
+    size: tuple[int, int],
+    *,
+    engine=None,
+    regraft: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Enlarge the display source (+depth) to a working size for evaluation.
+
+    With an SR ``engine`` the enlarge is a learned upscale (reconstructs texture)
+    resampled to ``size``; the SR result is returned as the regraft reference so
+    DLAA-erased texture can be restored afterwards. Without one it is Lanczos plus
+    a crispen (which invents nothing), and the reference is None. Returns
+    ``(linear, inverse_depth, reference_srgb_or_None)``.
+    """
+    big_w, big_h = size
+    depth = cv2.resize(inverse_depth, (big_w, big_h), interpolation=cv2.INTER_LINEAR)
+
+    if engine is not None:
+        sr = engine.upscale(np.clip(source_srgb, 0.0, 1.0).astype(np.float32))
+        if sr.shape[1] != big_w or sr.shape[0] != big_h:
+            # Model scale (×4) rarely equals the requested factor exactly; resize
+            # to the target. Detail came from the SR pass; this only sets size.
+            interp = cv2.INTER_AREA if sr.shape[1] > big_w else cv2.INTER_LANCZOS4
+            sr = cv2.resize(sr, (big_w, big_h), interpolation=interp)
+        sr = np.clip(sr, 0.0, 1.0).astype(np.float32)
+        linear = contract.srgb_to_linear(sr)
+        return linear, depth, (sr if regraft > 0.0 else None)
+
+    big_srgb = cv2.resize(source_srgb, (big_w, big_h), interpolation=cv2.INTER_LANCZOS4)
+    big_srgb = detail.sharpen(
+        np.clip(big_srgb, 0.0, 1.0).astype(np.float32),
+        amount=BOOST_CRISPEN_AMOUNT,
+        radius=BOOST_CRISPEN_RADIUS,
+    )
+    linear = contract.srgb_to_linear(np.clip(big_srgb, 0.0, 1.0))
+    return linear, depth, None
+
+
+def _regraft(dlss_linear: np.ndarray, reference_srgb: np.ndarray | None, amount: float) -> np.ndarray:
+    """Restore the SR reference's high-frequency texture onto the DLSS result.
+
+    DLSS's neural pass anti-aliases, which on fine regular texture (brick,
+    façades, mesh) reads as aliasing and smooths it away — unacceptable for
+    architectural work. Because the SR tile (before DLSS) and the DLSS result are
+    the same size, we graft the SR tile's real high-frequency band back on. It is
+    a frequency graft of genuine detail (see detail.preserve_detail), not a
+    sharpen, so it cannot halo. Done in display space, returned linear.
+    """
+    if reference_srgb is None or amount <= 0.0:
+        return dlss_linear
+    dlss_srgb = np.clip(contract.linear_to_srgb(dlss_linear), 0.0, 1.0)
+    if reference_srgb.shape != dlss_srgb.shape:
+        return dlss_linear
+    grafted = detail.preserve_detail(
+        dlss_srgb, reference_srgb, amount=float(amount), radius=detail.DEFAULT_RADIUS
+    )
+    return contract.srgb_to_linear(np.clip(grafted, 0.0, 1.0))
+
+
+def _run_ultra_stream(
+    source_srgb: np.ndarray,
+    inverse_depth: np.ndarray,
+    *,
+    settings: AppSettings,
+    scratch: Path,
+    dest_tiff: Path,
+    evaluate,
+    engine=None,
+    say: Progress | None = None,
+) -> tuple[tuple[int, int], np.ndarray]:
+    """Tiled SR→DLSS→regraft, streamed to a BigTIFF at ``dest_tiff``.
+
+    Returns ``((full_w, full_h), native_srgb)`` — the on-disk full size and a
+    native-resolution downscale for the preview and the native copy. The full
+    image never exists in RAM: tiles are fed into a disk-backed
+    :class:`tiling.StreamMerger` and written out as a BigTIFF strip by strip, so
+    peak memory is one tile.
+
+    ``evaluate(linear, inverse_depth, tile) -> linear`` runs the DLSS pass; it is
+    injected so the whole tiling/SR/merge/stream path can be tested without a GPU.
+    """
+    h, w = source_srgb.shape[:2]
+    factor, tile_max, overlap = tiling.auto_ultra(
+        w, h,
+        requested_factor=settings.detail.ultra_factor,
+        ram_free=hardware.query_system_ram(),
+        vram_free=_free_vram_bytes(),
+        max_factor=settings.detail.ultra_max_factor,
+    )
+    big_w = max(w, int(round(w * factor)))
+    big_h = max(h, int(round(h * factor)))
+    tiles = tiling.plan_tiles(big_w, big_h, tile_max, overlap)
+    regraft = settings.detail.sr_regraft if engine is not None else 0.0
+
+    merger = tiling.StreamMerger(big_h, big_w, 3, overlap, scratch)
+    # Native downscale is small, so it is merged in RAM from per-tile downscales.
+    native_overlap = max(1, int(round(overlap * w / big_w)))
+    native_tiles: list[tiling.Tile] = []
+    native_patches: list[np.ndarray] = []
+    try:
+        for index, tile in enumerate(tiles, 1):
+            if say:
+                say(f"Ultra Detail: tile {index} of {len(tiles)} ({tile.w}×{tile.h})…")
+            # The native region this big tile came from (map back by the factor).
+            nx0 = min(w - 1, int(tile.x * w / big_w))
+            ny0 = min(h - 1, int(tile.y * h / big_h))
+            nx1 = min(w, int(round(tile.right * w / big_w)))
+            ny1 = min(h, int(round(tile.bottom * h / big_h)))
+            src_region = np.ascontiguousarray(source_srgb[ny0:ny1, nx0:nx1])
+            depth_region = np.ascontiguousarray(inverse_depth[ny0:ny1, nx0:nx1])
+
+            linear, depth, reference = _enlarge_for_dlss(
+                src_region, depth_region, (tile.w, tile.h), engine=engine, regraft=regraft
+            )
+            dlss_linear = evaluate(
+                np.ascontiguousarray(linear), np.ascontiguousarray(depth), tile
+            )
+            merged_linear = _regraft(dlss_linear, reference, regraft)
+            # Sharpen each tile after DLSS (which softens), before the merge —
+            # cheap per tile, and equivalent to sharpening the whole huge image.
+            merged_linear = detail.sharpen(
+                merged_linear, amount=ULTRA_TILE_SHARPEN_AMOUNT,
+                radius=ULTRA_TILE_SHARPEN_RADIUS, preserve_range=True,
+            )
+            merger.add(tile, merged_linear)
+
+            # A native-sized downscale of this tile, for the native copy/preview.
+            n_tile = tiling.Tile(nx0, ny0, nx1 - nx0, ny1 - ny0)
+            native_tiles.append(n_tile)
+            native_patches.append(
+                cv2.resize(merged_linear, (n_tile.w, n_tile.h), interpolation=cv2.INTER_AREA)
+            )
+
+        if say:
+            say("Ultra Detail: writing the full-resolution image to disk…")
+        rows = (
+            (y0, np.clip(contract.linear_to_srgb(block), 0.0, 1.0))
+            for y0, block in merger.rows()
         )
-    if estimated > usable:
-        raise RuntimeError(
-            f"Boost at {width}×{height} is estimated to need about "
-            f"{estimated / 1024**3:.1f} GB of VRAM, but {info.name} has "
-            f"{info.free_bytes / 1024**3:.1f} GB free right now. Choose a lower "
-            "Boost factor or Max size, or close other GPU applications."
-        )
+        bigtiff.write_streaming(dest_tiff, big_h, big_w, rows, bits=16)
+    finally:
+        merger.close()
+
+    native_linear = tiling.merge_tiles((h, w), native_tiles, native_patches, native_overlap)
+    native_srgb = np.clip(contract.linear_to_srgb(native_linear), 0.0, 1.0).astype(np.float32)
+    return (big_w, big_h), native_srgb
 
 
 def depth_preview(inverse_depth: np.ndarray) -> np.ndarray:
@@ -197,12 +444,21 @@ def convert(
     engine: DepthEngine,
     progress: Progress | None = None,
     prepared: Prepared | None = None,
+    grade_settings=None,
+    effects_settings=None,
+    luts_dir: Path | None = None,
 ) -> Result:
     """Run the full pipeline on one image.
 
     `prepared` skips loading and depth estimation when the caller already has
     them for this image and these depth settings. Nothing here validates that
     claim — the UI owns invalidating its cache when the model or tiling changes.
+
+    `grade_settings`/`effects_settings` are used only by **Ultra**: its output is
+    too large to grade/effect afterwards, so the look is baked into the source
+    *before* the SR+DLSS pipeline (Result.look_baked is then True). Every other
+    mode ignores them — the app applies the grade/effects live on the preview and
+    at save time, exactly as before.
     """
 
     def say(message: str) -> None:
@@ -229,101 +485,118 @@ def convert(
     if linear is None:
         linear = contract.srgb_to_linear(np.clip(source, 0.0, 1.0))
 
-    # Boost: supersample the input so DLAA's fixed-size softening covers far less
-    # of each real detail, then deliver at the native size. Proven to keep brick
-    # and mesh crisp on renders. The crispen is done in display space (where an
-    # unsharp mask is defined) and taken back to linear for DLSS; depth rides
-    # along at the same scale. `source` and the native depth are kept for the
-    # Result, so the before/after and the depth mask stay native-sized.
-    boost_factor = 1
-    target_wh = (width, height)
-    native_inverse_depth = inverse_depth
-    if settings.detail.mode == "boost":
-        boost_factor = max(1, int(settings.detail.supersample))
-        if boost_factor > 1:
-            say(f"Detail boost: supersampling ×{boost_factor}…")
-            big_w, big_h = _boost_target(boost_factor, width, height)
-            _preflight_boost_vram(big_w, big_h, say)
-            big_srgb = cv2.resize(source, (big_w, big_h), interpolation=cv2.INTER_LANCZOS4)
-            big_srgb = detail.sharpen(
-                np.clip(big_srgb, 0.0, 1.0).astype(np.float32),
-                amount=settings.detail.amount * 2.0,
-                radius=settings.detail.radius,
-            )
-            linear = contract.srgb_to_linear(np.clip(big_srgb, 0.0, 1.0))
-            inverse_depth = cv2.resize(
-                inverse_depth, (big_w, big_h), interpolation=cv2.INTER_LINEAR
-            )
-            height, width = big_h, big_w
-
-    say("Building the DLAA contract…")
-    plan = contract.build(
-        linear,
-        inverse_depth,
-        depth_contrast=settings.depth.contrast,
-        frames=settings.evaluation.frames,
-        jitter=settings.evaluation.jitter,
-        already_linear=True,
-    )
+    # Detail decides how large the neural pass runs. `source` and the native
+    # depth are kept untouched for the Result, so the before/after and the depth
+    # preview stay native-sized whatever the working resolution was.
     scratch = paths.scratch_dir()
-    plane_paths = contract.write_planes(plan, scratch)
-    colour_path = plane_paths["colour"]
+    colour_path = scratch / "colour.bin"
     out_path = scratch / "out.bin"
+    native_wh = (width, height)
+    free_bytes = _free_vram_bytes()
+    mode = settings.detail.mode
+    # SR runs before DLSS in Boost/Ultra; None means Lanczos (model off/missing).
+    sr_engine = _make_upscale_engine(settings, say) if mode in ("boost", "ultra") else None
+    regraft = settings.detail.sr_regraft if sr_engine is not None else 0.0
 
-    def write_colour(path: Path, offset: tuple[float, float]) -> None:
-        shifted = contract.shift_subpixel(linear, offset[0], offset[1])
-        plane = np.empty((height, width, 4), np.float16)
-        plane[..., :3] = shifted.astype(np.float16)
-        plane[..., 3] = np.float16(1.0)
-        plane.tofile(path)
+    if mode == "ultra":
+        # Ultra Detail streams the full-resolution result to a scratch BigTIFF as
+        # it merges, so the giant image never lives in RAM (the freeze). Save later
+        # just moves/re-encodes that file. Only a native downscale comes back for
+        # the preview.
+        ultra_tiff = scratch / "ultra_full.tiff"
 
-    try:
-        evaluator.run_frames(
-            status.harness,
-            width=width,
-            height=height,
-            depth_path=plane_paths["depth"],
-            motion_path=plane_paths["motion"],
-            colour_path=colour_path,
-            out_path=out_path,
-            neural=settings.neural,
-            jitter=plan.jitter,
-            write_colour=write_colour,
-            progress=progress,
+        # The grade/effects look cannot be applied to the giant output afterwards,
+        # so bake it into the source here (cheap, native size) and let the SR+DLSS
+        # pipeline carry it into the full-resolution result. The app then shows and
+        # saves the result as-is (Result.look_baked), applying nothing more.
+        look_baked = False
+        ultra_source = source
+        effects_on = effects_settings is not None and not effects_settings.is_neutral
+        grade_on = grade_settings is not None and not grade_settings.is_neutral
+        if grade_on or effects_on:
+            say("Ultra Detail: baking the colour and effects into the source…")
+            look = np.clip(source, 0.0, 1.0).astype(np.float32)
+            if grade_on:
+                look = grade.apply(look, grade_settings)
+            if effects_on:
+                look = effects.apply(look, effects_settings, luts_dir or paths.luts_dir())
+            ultra_source = np.clip(look, 0.0, 1.0).astype(np.float32)
+            look_baked = True
+
+        def _eval_tile(lin: np.ndarray, dep: np.ndarray, _tile) -> np.ndarray:
+            return _evaluate_linear(
+                status.harness, lin, dep, settings=settings, scratch=scratch,
+                out_path=out_path, colour_path=colour_path, label="Ultra tile",
+                progress=progress,
+            )
+
+        (big_w, big_h), native_srgb = _run_ultra_stream(
+            ultra_source, inverse_depth, settings=settings, scratch=scratch,
+            dest_tiff=ultra_tiff, evaluate=_eval_tile, engine=sr_engine, say=say,
         )
-    except evaluator.HarnessError as error:
-        # Current DLSS builds can reject a feature above their supported working
-        # resolution with InvalidParameter even when D3D12 and VRAM both allow
-        # the textures. Do not silently reduce Boost; name the actual attempted
-        # size and let a future runtime with a higher limit try the same request.
-        if (
-            boost_factor > 1
-            and "CREATE_DLSS" in str(error)
-            and "InvalidParameter" in str(error)
-        ):
-            raise RuntimeError(
-                f"DLSS rejected the requested {width}×{height} Boost working "
-                "size even though it passed the VRAM and D3D12 checks. This "
-                "is a runtime feature limit rather than an out-of-memory error "
-                "(reference testing succeeds at 7680 pixels and rejects 10240). "
-                "Choose a lower Boost factor or Max size. The app did not "
-                "silently substitute a smaller factor."
-            ) from error
-        raise
+        sr_note = " (AI upscaled)" if sr_engine is not None else " (Lanczos)"
+        return Result(
+            original=np.clip(source, 0.0, 1.0),
+            enhanced=native_srgb,
+            depth_preview=depth_preview(inverse_depth),
+            notes=(
+                f"{width}x{height} → {big_w}x{big_h} full, "
+                f"{settings.evaluation.frames} DLSS passes, ultra{sr_note}"
+            ),
+            ultra_full_path=ultra_tiff,
+            ultra_full_size=(big_w, big_h),
+            look_baked=look_baked,
+        )
 
-    say("Encoding…")
-    enhanced_linear = contract.read_output(out_path, width, height)
+    detail_note = ""
+    if mode == "boost":
+        # Boost: one enlarged evaluation, sized automatically to the largest a
+        # single pass legally allows. The enlarge is SR (reconstructs detail) when
+        # available, else Lanczos; the SR reference is grafted back after DLSS so
+        # DLAA cannot erase texture.
+        factor = tiling.auto_boost_factor(width, height, free_bytes=free_bytes)
+        if factor >= BOOST_MIN_FACTOR:
+            big_w, big_h = int(round(width * factor)), int(round(height * factor))
+            how = "AI upscale" if sr_engine is not None else "supersample"
+            say(f"Detail boost: {how} to {big_w}×{big_h}…")
+            big_linear, big_depth, reference = _enlarge_for_dlss(
+                source, inverse_depth, (big_w, big_h), engine=sr_engine, regraft=regraft
+            )
+            enhanced_big = _evaluate_linear(
+                status.harness, big_linear, big_depth,
+                settings=settings, scratch=scratch, out_path=out_path,
+                colour_path=colour_path, label="Boost", progress=progress,
+            )
+            enhanced_big = _regraft(enhanced_big, reference, regraft)
+            enhanced_linear = cv2.resize(enhanced_big, native_wh, interpolation=cv2.INTER_AREA)
+            # Restore the bite the area-average shrink cost. Gentle, range-kept so
+            # an HDR boost is not clipped.
+            enhanced_linear = detail.sharpen(
+                enhanced_linear, amount=BOOST_POST_SHARPEN_AMOUNT,
+                radius=BOOST_POST_SHARPEN_RADIUS, preserve_range=True,
+            )
+            detail_note = f", boost ×{factor:.1f}" + (" (AI)" if sr_engine is not None else "")
+        else:
+            # Already near the ceiling: supersampling would gain a few percent for
+            # a full extra evaluation. Run native and say so rather than pretend.
+            say("Boost: already near the size ceiling — running at native size…")
+            enhanced_linear = _evaluate_linear(
+                status.harness, linear, inverse_depth,
+                settings=settings, scratch=scratch, out_path=out_path,
+                colour_path=colour_path, label="native", progress=progress,
+            )
+            detail_note = ", boost (native — no headroom)"
 
-    if boost_factor > 1:
-        # Concentrate the supersampled result back to the native size. Area
-        # averaging in linear light is the clean downsample — this is the step
-        # that turns "processed at 4x" into crisp native detail.
-        enhanced_linear = cv2.resize(enhanced_linear, target_wh, interpolation=cv2.INTER_AREA)
-        width, height = target_wh
-        inverse_depth = native_inverse_depth
+    else:  # off
+        say("Building the DLAA contract…")
+        enhanced_linear = _evaluate_linear(
+            status.harness, linear, inverse_depth,
+            settings=settings, scratch=scratch, out_path=out_path,
+            colour_path=colour_path, label="native", progress=progress,
+        )
 
-    boost_note = f", boost ×{boost_factor}" if boost_factor > 1 else ""
-    notes = f"{width}x{height}, {settings.evaluation.frames} DLSS passes{boost_note}"
+    width, height = native_wh
+    notes = f"{width}x{height}, {settings.evaluation.frames} DLSS passes{detail_note}"
     if prepared.hdr:
         # Tone map with the source's white point, not one measured on this
         # image: the two are shown side by side under a wipe, and a different
@@ -358,7 +631,8 @@ class SequenceFrame:
 
 
 def hdr_output_path(
-    destination: Path, stem: str, source: Path, style: str | None = None
+    destination: Path, stem: str, source: Path, style: str | None = None,
+    fmt: str | None = None,
 ) -> Path:
     """Where a converted frame goes, in a format that can hold what it holds.
 
@@ -367,9 +641,14 @@ def hdr_output_path(
     that is what lets it skip files it has already done.
 
     ``style`` (default/natural/cinematic) is written into the name when given, so
-    a folder of results says which look each was made with.
+    a folder of results says which look each was made with. ``fmt`` (an extension
+    without the dot, e.g. "png"/"jpg"/"tif"/"jxr") forces the output type; when
+    None the type matches the source (JPEG XR for HDR, PNG otherwise).
     """
-    suffix = ".jxr" if hdr.is_hdr_source(source) else ".png"
+    if fmt:
+        suffix = f".{fmt.lstrip('.')}"
+    else:
+        suffix = ".jxr" if hdr.is_hdr_source(source) else ".png"
     tag = f"_{style}" if style else ""
     return destination / f"{stem}_dlss5{tag}{suffix}"
 
@@ -382,8 +661,6 @@ def _finish(
     white: float,
     effects_settings=None,
     luts_dir: Path | None = None,
-    detail_settings=None,
-    source_srgb: np.ndarray | None = None,
 ) -> tuple[np.ndarray, bool, np.ndarray]:
     """Grade, apply effects, and encode one result. Returns (payload, linear, preview).
 
@@ -416,17 +693,6 @@ def _finish(
     enhanced = np.clip(contract.linear_to_srgb(enhanced_linear), 0.0, 1.0)
     if grade_settings is not None:
         enhanced = grade.apply(enhanced, grade_settings)
-    # Detail (Preserve) before effects, matching the app's display order, and
-    # only when a same-size source is on hand to lift the real detail from.
-    if (
-        detail_settings is not None
-        and detail_settings.mode == "preserve"
-        and source_srgb is not None
-        and source_srgb.shape == enhanced.shape
-    ):
-        enhanced = detail.preserve_detail(
-            enhanced, source_srgb, amount=detail_settings.amount, radius=detail_settings.radius
-        )
     if active:
         enhanced = effects.apply(enhanced, effects_settings, luts_dir)
     return enhanced, False, enhanced
@@ -576,8 +842,6 @@ def convert_sequence(
                 white=white,
                 effects_settings=settings.effects,
                 luts_dir=luts_dir,
-                detail_settings=settings.detail,
-                source_srgb=source,
             )
             output = hdr_output_path(
                 destination, frame_path.stem, frame_path, style_slug(settings.neural.style)
@@ -753,13 +1017,10 @@ def convert_video(
             )
             if grade_settings is not None:
                 enhanced = grade.apply(enhanced, grade_settings)
-            # Detail (Preserve) before effects, lifting the fine texture back
-            # from this frame's own source (fitted is display sRGB at this size).
-            if settings.detail.mode == "preserve" and fitted.shape == enhanced.shape:
-                enhanced = detail.preserve_detail(
-                    enhanced, np.clip(fitted, 0.0, 1.0).astype(np.float32),
-                    amount=settings.detail.amount, radius=settings.detail.radius,
-                )
+            # Detail (Boost/Ultra) is a single-image, supersampled operation and
+            # is not applied per video frame — it would multiply an already
+            # frame-by-frame conversion by the tile count. Video keeps the neural
+            # pass at native size; the grade and effects still apply.
             # Video frames are display-referred (the codecs are 8-bit SDR), so
             # the plain sRGB effect path — the same one the photo save uses.
             enhanced = effects.apply(enhanced, settings.effects, luts_dir)
@@ -811,6 +1072,7 @@ def convert_batch(
     destination: Path,
     grade_settings=None,
     skip_existing: bool = True,
+    save_format: str | None = None,
     progress: Progress | None = None,
     should_stop: Callable[[], bool] | None = None,
 ):
@@ -875,7 +1137,8 @@ def convert_batch(
                 return
 
             output = hdr_output_path(
-                destination, path.stem, path, style_slug(settings.neural.style)
+                destination, path.stem, path, style_slug(settings.neural.style),
+                fmt=save_format,
             )
             if skip_existing and output.exists():
                 yield BatchItem(index, len(images), path, output, skipped=True)
@@ -932,8 +1195,6 @@ def convert_batch(
                     white=white,
                     effects_settings=settings.effects,
                     luts_dir=luts_dir,
-                    detail_settings=settings.detail,
-                    source_srgb=source,
                 )
                 save_image(payload, output, linear=is_linear)
                 yield BatchItem(index, len(images), path, output, image=preview)
@@ -1083,8 +1344,19 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     result = convert(args.input, settings, OnnxDepthEngine(), progress=print)
-    save_image(result.enhanced, output)
-    print(f"Wrote {output} ({result.notes})")
+    # Ultra saves only the full-resolution BigTIFF (a downscaled copy loses
+    # detail): move the streamed scratch file next to the output.
+    if result.has_full and result.ultra_full_path is not None:
+        import shutil
+
+        fw, fh = result.ultra_full_size or (0, 0)
+        kk = f"{round(max(fw, fh) / 1000)}K"
+        super_out = output.with_name(f"{output.stem}_ultra_{kk}.tiff")
+        shutil.move(str(result.ultra_full_path), str(super_out))
+        print(f"Wrote {super_out} (Ultra Detail {fw}x{fh})")
+    else:
+        save_image(result.enhanced, output)
+        print(f"Wrote {output} ({result.notes})")
 
 
 def _default_output(input_path: str | Path, style: str = "") -> Path:

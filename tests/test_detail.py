@@ -1,4 +1,9 @@
-"""Detail recovery: the Preserve blend and the unsharp fallback."""
+"""Detail utilities: the frequency-graft blend and the unsharp fallback.
+
+``preserve_detail`` and ``sharpen`` are retained image-space helpers — sharpen
+is the crispen step Boost/Ultra run before the neural pass. The Preserve *mode*
+was retired; these tests cover the maths, plus the settings migration off it.
+"""
 
 from __future__ import annotations
 
@@ -67,45 +72,34 @@ def test_sharpen_increases_acutance():
     assert _sharpness(detail.sharpen(img, amount=1.5)) > _sharpness(img)
 
 
-def test_boost_keeps_the_requested_factor_above_the_old_8k_cap():
-    from dlss5_converter.pipeline import _boost_target
-    assert _boost_target(4, 3840, 2160) == (15360, 8640)
-
-
-def test_boost_refuses_only_the_d3d12_texture_limit():
-    from dlss5_converter.pipeline import _boost_target
-    with pytest.raises(RuntimeError, match="D3D12 textures stop at 16384"):
-        _boost_target(8, 3840, 2160)
-
-
-def test_boost_vram_preflight_uses_current_free_memory(monkeypatch):
-    from dlss5_converter import hardware, pipeline
-    monkeypatch.setattr(
-        hardware,
-        "query_nvidia_vram",
-        lambda: hardware.VramInfo("RTX test", 16 * 1024**3, 15 * 1024**3, 1024**3),
-    )
-    with pytest.raises(RuntimeError, match="RTX test has 1.0 GB free"):
-        pipeline._preflight_boost_vram(8000, 8000)
-
-
-def test_boost_vram_preflight_allows_an_unknown_query(monkeypatch):
-    from dlss5_converter import hardware, pipeline
-    messages = []
-    monkeypatch.setattr(hardware, "query_nvidia_vram", lambda: None)
-    pipeline._preflight_boost_vram(8000, 8000, messages.append)
-    assert "letting D3D12 decide" in messages[0]
-
-
 def test_detail_settings_round_trip(tmp_path):
     path = tmp_path / "settings.json"
     a = AppSettings()
-    a.detail.mode = "boost"
-    a.detail.amount = 0.9
-    a.detail.supersample = 8
+    a.detail.mode = "ultra"
+    a.detail.ultra_max_factor = 3.0
     a.save(path)
     b = AppSettings.load(path)
-    assert b.detail.mode == "boost"
-    assert b.detail.amount == pytest.approx(0.9)
-    assert b.detail.supersample == 8
+    assert b.detail.mode == "ultra"
+    assert b.detail.ultra_max_factor == pytest.approx(3.0)
     assert AppSettings().detail.is_neutral  # default is off
+
+
+def test_old_preserve_mode_migrates_to_off():
+    """Settings from a build that had Preserve must not leave the pipeline in an
+    unknown mode — __post_init__ maps the retired value to off."""
+    assert DetailSettings(mode="preserve").mode == "off"
+    assert DetailSettings(mode="nonsense").mode == "off"
+    assert DetailSettings(mode="boost").mode == "boost"
+
+
+def test_old_settings_file_with_retired_keys_still_loads(tmp_path):
+    """A v0.3.x settings.json carrying amount/supersample/preserve loads clean:
+    unknown keys are dropped and the mode is migrated."""
+    path = tmp_path / "settings.json"
+    path.write_text(
+        '{"detail": {"mode": "preserve", "amount": 0.9, "supersample": 8}}',
+        encoding="utf-8",
+    )
+    loaded = AppSettings.load(path)
+    assert loaded.detail.mode == "off"
+    assert loaded.detail.is_neutral

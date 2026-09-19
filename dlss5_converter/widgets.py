@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from . import reveal
+from .i18n import tr
 from PySide6.QtCore import (
     QEasingCurve,
     QPoint,
@@ -839,7 +840,7 @@ class ImageView(CanvasView):
             self._pixmap.size() != pixmap.size()
         )
         self._pixmap = pixmap
-        self._caption = caption
+        self._caption = tr(caption)
         # A new picture invalidates the desaturated copy the progress sweep
         # draws; rebuilt on the next set_progress rather than eagerly, since
         # most images never see one.
@@ -1052,7 +1053,7 @@ class WipeView(CanvasView):
         style compare where neither half is "the output", so that caller turns
         it off and both pills read as neutral names.
         """
-        self._labels = (left, right) if (left or right) else None
+        self._labels = (tr(left), tr(right)) if (left or right) else None
         self._accent_right = accent_right
         self.update()
 
@@ -1357,7 +1358,7 @@ class SideBySideView(CanvasView):
         self.set_panes_u8([left, right])
 
     def set_labels(self, *labels: str) -> None:
-        self._labels = [text for text in labels]
+        self._labels = [tr(text) for text in labels]
         self.update()
 
     def clear(self) -> None:
@@ -1953,7 +1954,7 @@ class ChipSliderGroup(QWidget):
                 label, value, self._chip_setter(label, on_change), tooltip,
                 maximum=maximum, minimum=minimum,
             )
-            chip.setText(f"{label}  {row.formatted(value)}")
+            chip.setText(f"{tr(label)}  {row.formatted(value)}")
             self._rows_box.addWidget(row)
             self.rows[label] = row
             self._chips[label] = chip
@@ -1969,7 +1970,7 @@ class ChipSliderGroup(QWidget):
             chip = self._chips.get(label)
             row = self.rows.get(label)
             if chip is not None and row is not None:
-                chip.setText(f"{label}  {row.formatted(value)}")
+                chip.setText(f"{tr(label)}  {row.formatted(value)}")
             on_change(value)
         return wrapped
 

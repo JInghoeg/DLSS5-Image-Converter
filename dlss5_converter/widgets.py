@@ -1726,6 +1726,18 @@ class DownloadDialog(QDialog):
         self._detail.setText("  —  ".join(parts))
 
 
+class _ScrollSafeSlider(QSlider):
+    """A slider that never consumes the mouse wheel.
+
+    The sidebar itself scrolls vertically. Letting QSlider handle wheel events
+    makes ordinary page scrolling mutate parameters, and neural parameters can
+    launch a multi-second DLSS pass as a side effect.
+    """
+
+    def wheelEvent(self, event):  # noqa: N802 - Qt API
+        event.ignore()
+
+
 class SliderRow(QWidget):
     """A slider over 0..`maximum` with a live numeric readout."""
 
@@ -1763,7 +1775,7 @@ class SliderRow(QWidget):
         # a fraction of the range, so a 0..2 slider gets 200 positions and the
         # readout stays aimable at the same precision as a 0..1 one.
         self._steps = max(1, int(round((self._maximum - self._minimum) * 100)))
-        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider = _ScrollSafeSlider(Qt.Orientation.Horizontal)
         self._slider.setRange(0, self._steps)
         self._slider.setValue(self._to_raw(value))
         self._slider.valueChanged.connect(self._changed)

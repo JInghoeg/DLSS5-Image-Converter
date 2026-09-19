@@ -111,8 +111,18 @@ class QSpinBox(_QSpinBox):
     def setToolTip(self, text):  # noqa: N802
         return super().setToolTip(tr(text))
 
+    def wheelEvent(self, event):  # noqa: N802
+        # In a scrolling sidebar the wheel is navigation, not an edit gesture.
+        # Ignore here so the parent QScrollArea receives it instead of silently
+        # changing a value and triggering an expensive neural re-run.
+        event.ignore()
+
 
 class QComboBox(_QComboBox):
+    def wheelEvent(self, event):  # noqa: N802
+        # Prevent accidental selection changes while scrolling the sidebar.
+        event.ignore()
+
     def addItem(self, *args, **kwargs):  # noqa: N802
         values = list(args)
         for index, value in enumerate(values):

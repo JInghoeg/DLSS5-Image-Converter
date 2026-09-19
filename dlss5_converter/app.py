@@ -5806,6 +5806,13 @@ class MainWindow(QMainWindow):
 
     def _style_changed(self, index: int) -> None:
         self.settings.neural.style = index
+        self.settings.save(paths.settings_path())
+        # Style comparison already computes and caches every NRStyle. Changing
+        # the active style here only chooses what the next normal conversion or
+        # batch should use; re-running all three comparison panes would produce
+        # the same pixels and waste several harness startups.
+        if self._view == "styles":
+            return
         self._schedule_preview()
 
     def _live_toggled(self, value: bool) -> None:

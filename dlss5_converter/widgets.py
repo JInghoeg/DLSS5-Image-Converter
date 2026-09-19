@@ -187,6 +187,9 @@ class ModuleCard(QFrame):
         self.body.setSpacing(13)
         outer.addWidget(self._body_widget)
 
+    def setToolTip(self, text):  # noqa: N802 - Qt-style name
+        return super().setToolTip(tr(text))
+
     def add(self, widget: QWidget) -> QWidget:
         self.body.addWidget(widget)
         return widget
@@ -1726,6 +1729,9 @@ class DownloadDialog(QDialog):
 class SliderRow(QWidget):
     """A slider over 0..`maximum` with a live numeric readout."""
 
+    def setToolTip(self, text):  # noqa: N802 - Qt-style name
+        return super().setToolTip(tr(text))
+
     def __init__(
         self,
         label: str,
@@ -1899,6 +1905,9 @@ class ChipSliderGroup(QWidget):
     (a reset, a preset change) through ``set_value``.
     """
 
+    def setToolTip(self, text):  # noqa: N802 - Qt-style name
+        return super().setToolTip(tr(text))
+
     def __init__(
         self, params, mode: str = "compact", columns: int = 2,
         parent: QWidget | None = None,
@@ -2014,6 +2023,9 @@ class SegmentedControl(QWidget):
     """
 
     changed = Signal(int)
+
+    def setToolTip(self, text):  # noqa: N802 - Qt-style name
+        return super().setToolTip(tr(text))
 
     def __init__(self, options, current: int = 0, parent: QWidget | None = None) -> None:
         super().__init__(parent)

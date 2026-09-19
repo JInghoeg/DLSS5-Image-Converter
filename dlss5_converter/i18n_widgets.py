@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QProgressDialog as _QProgressDialog,
     QPushButton as _QPushButton,
     QStatusBar as _QStatusBar,
+    QSpinBox as _QSpinBox,
     QTabWidget as _QTabWidget,
 )
 
@@ -101,6 +102,14 @@ class QListWidget(_QListWidget):
 class QProgressBar(_QProgressBar):
     def setFormat(self, text):  # noqa: N802
         return super().setFormat(tr(text))
+
+    def setToolTip(self, text):  # noqa: N802
+        return super().setToolTip(tr(text))
+
+
+class QSpinBox(_QSpinBox):
+    def setToolTip(self, text):  # noqa: N802
+        return super().setToolTip(tr(text))
 
 
 class QComboBox(_QComboBox):

@@ -472,5 +472,9 @@
   "Saving the {fw}×{fh} Ultra Detail image ({Path(chosen).suffix.lstrip('.').upper()})…": "正在保存 {fw}×{fh} 超细节图像（{Path(chosen).suffix.lstrip('.').upper()}）…",
   "Saved {Path(chosen).name} ({fw}×{fh}, Ultra Detail)": "已保存 {Path(chosen).name}（{fw}×{fh}，超细节）",
   " (HDR kept)": "（保留 HDR）",
-  " (tone mapped to SDR)": "（已映射为 SDR）"
+  " (tone mapped to SDR)": "（已映射为 SDR）",
+  "The add-on's HDR controls. This pipeline is SDR end to end, but these still change the result — the neural pass reasons about light before anything is tonemapped back. Defaults match the add-on's own.": "RenoDX 插件的 HDR 控制项。本工具最终仍输出 SDR，但这些参数会在色调映射前影响神经渲染对光照的判断，因此仍会改变结果。默认值与插件一致。",
+  "The luminance the model treats as diffuse white. On an HDR or OLED display this decides how hard highlights are pushed. The add-on defaults to 1; shipping game configs use 16, where it stops changing.": "模型用于定义“漫反射白”的参考亮度。它不是显示器亮度，也不是普通曝光；会影响模型判断普通白色与高光之间的关系。插件默认值为 1，部分游戏配置使用 16；超过 16 后基本不再变化。",
+  "Strength of the transfer curve the pass works through. Range 0..1.": "神经渲染所使用的 HDR 传递曲线强度。范围 0–1。",
+  "How much of the model's colour change is kept. At 0 the source colour survives and only structure changes. Range 0..1.": "保留模型色彩变化的程度。设为 0 时尽量保留原图颜色，仅让结构细节发生变化。范围 0–1。"
 }

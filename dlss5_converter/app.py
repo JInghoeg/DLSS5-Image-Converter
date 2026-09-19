@@ -74,6 +74,7 @@ from .i18n_widgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
+    QSpinBox,
     QTabWidget,
 )
 from . import onnx_depth

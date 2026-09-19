@@ -398,5 +398,13 @@
   "Same image, same settings, same grade. Drag the divider; scroll to zoom, right-drag to pan.": "同一张图片、同一套设置、同一套调色。拖动分隔线；滚轮缩放，右键拖动平移。",
   "Default  ": "默认  ",
   "Natural  ": "自然  ",
-  "Cinematic  ": "电影感  "
+  "Cinematic  ": "电影感  ",
+  "Let's do your first conversion.": "开始第一次转换。",
+  "This is DLSS 5's neural renderer on a still frame — drag to compare the pass off and on. Choose an image and the short tour shows you where to tune the look, compare, and convert.": "这是 DLSS 5 神经渲染器处理静态图片的实际效果。拖动分隔线即可对比神经渲染开启与关闭的差异。选择一张图片后，简短教程会带你了解如何调整效果、进行对比并完成转换。",
+  "Skip tour": "跳过教程",
+  "Next": "下一步",
+  "Done": "完成",
+  "TUTORIAL  ·  {self._index + 1} / {len(self._steps)}": "教程  ·  {self._index + 1} / {len(self._steps)}",
+  "Step {self._index + 1} of {len(self._steps)}": "第 {self._index + 1}/{len(self._steps)} 步",
+  "GPU": "GPU"
 }

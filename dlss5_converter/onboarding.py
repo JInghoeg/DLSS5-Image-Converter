@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from .widgets import FONT_DISPLAY, FONT_MONO, apply_font
+from .i18n import tr
 from .i18n_widgets import QDialog, QLabel, QPushButton
 
 
@@ -112,7 +113,7 @@ class ComparisonPreview(QWidget):
         if self._before.isNull() or self._after.isNull():
             painter.fillRect(area, QColor("#0a111c"))
             painter.setPen(QColor("#8ea1ba"))
-            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, "DLSS 5 preview")
+            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, tr("DLSS 5 preview"))
             return
 
         mode = Qt.AspectRatioMode.KeepAspectRatioByExpanding
@@ -354,10 +355,14 @@ class SpotlightOverlay(QWidget):
             self._finish()
             return
         step = self._steps[self._index]
-        self.eyebrow.setText(f"TUTORIAL  ·  {self._index + 1} / {len(self._steps)}")
-        self.title.setText(f"{self._index + 1} · {step.title}")
-        self.body.setText(step.body)
-        self.counter.setText(f"Step {self._index + 1} of {len(self._steps)}")
+        self.eyebrow.setText(
+            tr(f"TUTORIAL  ·  {self._index + 1} / {len(self._steps)}")
+        )
+        self.title.setText(f"{self._index + 1} · {tr(step.title)}")
+        self.body.setText(tr(step.body))
+        self.counter.setText(
+            tr(f"Step {self._index + 1} of {len(self._steps)}")
+        )
         self.next_button.setText("Done" if self._index == len(self._steps) - 1 else "Next")
         self.card.adjustSize()
         self.step_changed.emit(self._index)

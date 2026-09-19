@@ -21,7 +21,11 @@ SUPPORTED_LANGUAGES = {
 _LANGUAGE = DEFAULT_LANGUAGE
 _CATALOG: dict[str, str] = {}
 _TEMPLATES: list[tuple[re.Pattern[str], list[str], str]] = []
-_PLACEHOLDER = re.compile(r"\{([A-Za-z_]\w*)(?::[^}]*)?\}")
+# Keep the expression text rather than requiring a Python identifier. Upstream
+# uses f-strings such as {len(images)} and {Path(source).name}; matching those
+# after formatting lets translations stay in the catalog instead of forcing
+# invasive edits at every call site.
+_PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 
 
 def _locale_path(language: str) -> Path:
@@ -31,17 +35,16 @@ def _locale_path(language: str) -> Path:
 
 
 def _compile_template(source: str, translated: str):
-    names: list[str] = []
+    fields: list[str] = []
     pieces: list[str] = []
     cursor = 0
     for match in _PLACEHOLDER.finditer(source):
         pieces.append(re.escape(source[cursor:match.start()]))
-        name = match.group(1)
-        names.append(name)
-        pieces.append(f"(?P<{name}>.+?)")
+        fields.append(match.group(1))
+        pieces.append("(.+?)")
         cursor = match.end()
     pieces.append(re.escape(source[cursor:]))
-    return re.compile("^" + "".join(pieces) + "$", re.DOTALL), names, translated
+    return re.compile("^" + "".join(pieces) + "$", re.DOTALL), fields, translated
 
 
 def set_language(language: str | None) -> str:
@@ -102,14 +105,13 @@ def tr(text: str, /, **values) -> str:
                 return translated
         return translated
 
-    for pattern, names, target in _TEMPLATES:
+    for pattern, fields, target in _TEMPLATES:
         match = pattern.match(text)
         if match:
-            captured = {name: match.group(name) for name in names}
-            try:
-                return target.format(**captured)
-            except (KeyError, ValueError):
-                return target
+            rendered = target
+            for index, field in enumerate(fields, start=1):
+                rendered = rendered.replace("{" + field + "}", match.group(index))
+            return rendered
 
     return text.format(**values) if values else text
 

@@ -9,10 +9,13 @@ from PySide6.QtWidgets import (
     QFileDialog as _QFileDialog,
     QGroupBox as _QGroupBox,
     QLabel as _QLabel,
+    QListWidget as _QListWidget,
     QMainWindow as _QMainWindow,
     QMessageBox as _QMessageBox,
+    QProgressBar as _QProgressBar,
     QProgressDialog as _QProgressDialog,
     QPushButton as _QPushButton,
+    QStatusBar as _QStatusBar,
     QTabWidget as _QTabWidget,
 )
 
@@ -69,12 +72,35 @@ class QDialog(_QDialog):
         return super().setToolTip(tr(text))
 
 
+class QStatusBar(_QStatusBar):
+    def showMessage(self, message, timeout=0):  # noqa: N802
+        return super().showMessage(tr(message), timeout)
+
+
 class QMainWindow(_QMainWindow):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Install a localized status bar once. Existing app code can keep calling
+        # self.statusBar().showMessage(...) with canonical English strings.
+        super().setStatusBar(QStatusBar(self))
+
     def setWindowTitle(self, title):  # noqa: N802
         return super().setWindowTitle(tr(title))
 
     def setToolTip(self, text):  # noqa: N802
         return super().setToolTip(tr(text))
+
+
+class QListWidget(_QListWidget):
+    def addItem(self, item):  # noqa: N802
+        if isinstance(item, str):
+            item = tr(item)
+        return super().addItem(item)
+
+
+class QProgressBar(_QProgressBar):
+    def setFormat(self, text):  # noqa: N802
+        return super().setFormat(tr(text))
 
 
 class QComboBox(_QComboBox):

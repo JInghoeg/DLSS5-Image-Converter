@@ -60,7 +60,7 @@ from . import (
 )
 from . import __version__
 from . import hdr as hdr_mod
-from .i18n import available_languages, set_language
+from .i18n import available_languages, set_language, tr
 from .i18n_widgets import (
     QCheckBox,
     QComboBox,
@@ -68,8 +68,10 @@ from .i18n_widgets import (
     QFileDialog,
     QGroupBox,
     QLabel,
+    QListWidget,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QTabWidget,
@@ -6261,7 +6263,7 @@ class MainWindow(QMainWindow):
             ("ReShade", status.reshade),
             ("Harness", status.harness),
         ):
-            lines.append(f"{label}: {value or 'not found'}")
+            lines.append(f"{tr(label)}: {value or tr('not found')}")
         if status.problems:
             lines.append("")
             lines += status.problems

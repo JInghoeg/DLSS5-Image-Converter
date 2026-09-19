@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
 )
 
 # Localized aliases keep English literals canonical while translating client text.
-from .i18n_widgets import QDialog, QLabel, QPushButton
+from .i18n_widgets import QCheckBox, QDialog, QFileDialog, QGroupBox, QLabel, QPushButton
 
 SUPPORTED = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr",
              ".hdr", ".jxr", ".wdp", ".hdp"}
@@ -159,7 +159,7 @@ class ModuleCard(QFrame):
         if checkable:
             # The title itself is the on/off control, like the old checkable
             # group box — a checkbox whose label is the card title.
-            from PySide6.QtWidgets import QCheckBox
+            from .i18n_widgets import QCheckBox
 
             self._check = QCheckBox(title)
             self._check.setObjectName("modTitle")
@@ -277,7 +277,7 @@ class DropZone(QFrame):
             event.acceptProposedAction()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
-        from PySide6.QtWidgets import QFileDialog
+        from .i18n_widgets import QFileDialog
 
         chosen, _ = QFileDialog.getOpenFileName(
             self,

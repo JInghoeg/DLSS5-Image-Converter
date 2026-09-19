@@ -20,7 +20,7 @@ CALLS = {
     "SliderRow", "TourStep", "stage_placeholder",
 }
 METHODS = {
-    "setWindowTitle", "setToolTip", "setText", "showMessage",
+    "setWindowTitle", "setToolTip", "setText", "showMessage", "setFormat",
     "setPlaceholderText", "information", "warning", "critical", "question",
     "getOpenFileName", "getOpenFileNames", "getSaveFileName",
     "getExistingDirectory",

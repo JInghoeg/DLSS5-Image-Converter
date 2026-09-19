@@ -1,3 +1,20 @@
+# DLSS5-Image-Converter 简体中文客户端
+
+这是 [criso2hd-alt/DLSS5-Image-Converter](https://github.com/criso2hd-alt/DLSS5-Image-Converter) 的简体中文客户端本地化 fork。
+
+我们完成了客户端 UI 的简体中文本地化，并采用非破坏式 i18n 结构：英文源码继续作为原始文本，中文独立存放在语言资源中；缺失翻译会自动回退为英文，方便保持与上游代码结构兼容。
+
+当前中文化覆盖包括主界面、图片/视频/图像序列工作流、Effects、设置、首次运行与教程、DLSS 运行环境检查、风格对比、导出与批处理、HDR/显示说明、Tooltip、动态状态和运行时诊断等。另补充了少量客户端交互修正，包括避免滚轮误改参数，以及减少风格对比界面的冗余重算。
+
+**中文客户端代码位于：** `i18n/zh-cn` 分支  
+**实现说明：** [docs/ZH_CN_CLIENT_LOCALIZATION.md](docs/ZH_CN_CLIENT_LOCALIZATION.md)
+
+> 本地化仅针对客户端界面；DLSS / NGX / RenoDX 核心处理逻辑保持原样。
+
+---
+
+## Upstream README
+
 # DLSS 5 Image & Video Converter
 
 Run NVIDIA's DLSS 5 neural renderer over a **still image or a video** instead of a

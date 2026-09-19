@@ -25,7 +25,9 @@ _PLACEHOLDER = re.compile(r"\{([A-Za-z_]\w*)(?::[^}]*)?\}")
 
 
 def _locale_path(language: str) -> Path:
-    return Path(__file__).with_name("locales") / f"{language}.json"
+    # Locales live under assets so the existing PyInstaller --add-data rule
+    # carries them into portable builds without touching the release pipeline.
+    return Path(__file__).with_name("assets") / "locales" / f"{language}.json"
 
 
 def _compile_template(source: str, translated: str):

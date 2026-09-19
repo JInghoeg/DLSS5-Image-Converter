@@ -54,6 +54,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+# Localized aliases keep English literals canonical while translating client text.
+from .i18n_widgets import QDialog, QLabel, QPushButton
+
 SUPPORTED = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr",
              ".hdr", ".jxr", ".wdp", ".hdp"}
 

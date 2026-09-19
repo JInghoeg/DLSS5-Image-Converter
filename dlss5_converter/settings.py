@@ -322,6 +322,9 @@ class AppSettings:
     #: chips over a single slider; "full" stacks every slider at once. Compact by
     #: default because it is what keeps the sidebar from reading as a wall.
     density: str = "compact"
+    #: Client UI language. English source text remains canonical and missing
+    #: translations fall back to English, so upstream additions never break UI.
+    language: str = "zh_CN"
     #: Zero only for a fresh install. Completing or skipping the introduction
     #: writes the current version so normal launches go straight to work.
     onboarding_version: int = 0
@@ -369,6 +372,7 @@ class AppSettings:
             last_output_dir=str(raw.get("last_output_dir") or ""),
             theme=str(raw.get("theme") or "Neural Cyan"),
             density=str(raw.get("density") or "compact"),
+            language=str(raw.get("language") or "zh_CN"),
             # Do not surprise established users with a first-run flow after an
             # update. A settings file with no key is proof this is not a fresh
             # install, so migrate it as already introduced.

@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from .widgets import FONT_DISPLAY, FONT_MONO, apply_font
+from .i18n_widgets import QDialog, QLabel, QPushButton
 
 
 def _css_cubic_bezier(x1: float, y1: float, x2: float, y2: float) -> QEasingCurve:

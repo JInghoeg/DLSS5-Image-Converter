@@ -60,6 +60,20 @@ from . import (
 )
 from . import __version__
 from . import hdr as hdr_mod
+from .i18n import available_languages, set_language
+from .i18n_widgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QGroupBox,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QProgressDialog,
+    QPushButton,
+    QTabWidget,
+)
 from . import onnx_depth
 from .depth_engine import MODELS, DepthEngine
 from .onnx_depth import SMALL as SMALL_DEPTH_MODEL
@@ -4084,6 +4098,18 @@ class MainWindow(QMainWindow):
         colour.setAlpha(150)
         self._convert_glow.setColor(colour)
 
+    def _language_changed(self, _index: int) -> None:
+        language = self.language_box.currentData() or "en"
+        if language == self.settings.language:
+            return
+        self.settings.language = language
+        self.settings.save(paths.settings_path())
+        QMessageBox.information(
+            self,
+            "Language changed",
+            "Restart the app to apply the new language.",
+        )
+
     def _theme_changed(self, _index: int) -> None:
         name = self.theme_box.currentData() or DEFAULT_THEME
         self.settings.theme = name
@@ -4199,6 +4225,18 @@ class MainWindow(QMainWindow):
 
         # -- Appearance --
         appearance = ModuleCard("Appearance")
+        language_row = QHBoxLayout()
+        language_row.addWidget(QLabel("Language"))
+        self.language_box = QComboBox()
+        for code, label in available_languages():
+            self.language_box.addItem(label, code)
+        language_index = self.language_box.findData(self.settings.language)
+        self.language_box.setCurrentIndex(language_index if language_index >= 0 else 0)
+        self.language_box.currentIndexChanged.connect(self._language_changed)
+        language_row.addStretch(1)
+        language_row.addWidget(self.language_box, 1)
+        appearance.add_layout(language_row)
+
         theme_row = QHBoxLayout()
         theme_row.addWidget(QLabel("Colour theme"))
         self.theme_box = QComboBox()
@@ -6402,8 +6440,11 @@ def main() -> None:
     app.setApplicationName("DLSS 5 Image & Video Converter")
     _load_bundled_fonts(app)
     try:
-        theme = AppSettings.load(paths.settings_path()).theme
+        startup_settings = AppSettings.load(paths.settings_path())
+        set_language(startup_settings.language)
+        theme = startup_settings.theme
     except Exception:  # noqa: BLE001 - a bad settings file must not block launch
+        set_language("zh_CN")
         theme = DEFAULT_THEME
     apply_app_theme(app, theme)
     # Before the window: nothing in it works without a depth model, and the

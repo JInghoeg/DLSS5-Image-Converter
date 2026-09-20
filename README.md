@@ -24,7 +24,7 @@
 - 修正右侧滚动区域中滚轮误改 Slider / SpinBox / ComboBox 参数的问题
 - 减少“对比风格”视图中切换当前活动风格造成的冗余重算
 
-当前简中词库：**478 条**。
+当前简中词库：**494 条**。
 
 详细实现记录见：[docs/ZH_CN_CLIENT_LOCALIZATION.md](docs/ZH_CN_CLIENT_LOCALIZATION.md)
 

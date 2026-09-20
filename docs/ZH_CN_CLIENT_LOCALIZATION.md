@@ -58,7 +58,7 @@ QPushButton("Check runtime")
 
 ### 2. 简中词库
 
-当前 `zh_CN.json` 包含 **478 条客户端翻译词条**。
+当前 `zh_CN.json` 包含 **494 条客户端翻译词条**。
 
 词条包括：
 

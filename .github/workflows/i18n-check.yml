@@ -1,0 +1,24 @@
+name: i18n client checks
+
+on:
+  push:
+    branches: [ "main", "i18n/zh-cn" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  client-i18n:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m compileall -q dlss5_converter tests scripts/check_i18n.py
+      - name: Install test runner
+        run: python -m pip install pytest
+      - name: Localization unit tests
+        run: python -m pytest -q tests/test_i18n.py
+      - name: Translation coverage check
+        run: python scripts/check_i18n.py

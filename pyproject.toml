@@ -8,7 +8,7 @@ version = "0.3.3"
 description = "Run NVIDIA's DLSS 5 neural renderer over still images."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-license = {text = "MIT"}
+license = {file = "LICENSE"}
 dependencies = [
   "PySide6>=6.8,<7",
   "numpy>=1.26,<3",

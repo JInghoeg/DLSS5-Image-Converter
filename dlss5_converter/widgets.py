@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from . import reveal
+from .i18n import tr
 from PySide6.QtCore import (
     QEasingCurve,
     QPoint,
@@ -53,6 +54,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+# Localized aliases keep English literals canonical while translating client text.
+from .i18n_widgets import QCheckBox, QDialog, QFileDialog, QGroupBox, QLabel, QProgressBar, QPushButton
 
 SUPPORTED = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr",
              ".hdr", ".jxr", ".wdp", ".hdp"}
@@ -156,7 +160,7 @@ class ModuleCard(QFrame):
         if checkable:
             # The title itself is the on/off control, like the old checkable
             # group box — a checkbox whose label is the card title.
-            from PySide6.QtWidgets import QCheckBox
+            from .i18n_widgets import QCheckBox
 
             self._check = QCheckBox(title)
             self._check.setObjectName("modTitle")
@@ -182,6 +186,9 @@ class ModuleCard(QFrame):
         self.body.setContentsMargins(16, 14, 16, 15)
         self.body.setSpacing(13)
         outer.addWidget(self._body_widget)
+
+    def setToolTip(self, text):  # noqa: N802 - Qt-style name
+        return super().setToolTip(tr(text))
 
     def add(self, widget: QWidget) -> QWidget:
         self.body.addWidget(widget)
@@ -274,7 +281,7 @@ class DropZone(QFrame):
             event.acceptProposedAction()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
-        from PySide6.QtWidgets import QFileDialog
+        from .i18n_widgets import QFileDialog
 
         chosen, _ = QFileDialog.getOpenFileName(
             self,
@@ -836,7 +843,7 @@ class ImageView(CanvasView):
             self._pixmap.size() != pixmap.size()
         )
         self._pixmap = pixmap
-        self._caption = caption
+        self._caption = tr(caption)
         # A new picture invalidates the desaturated copy the progress sweep
         # draws; rebuilt on the next set_progress rather than eagerly, since
         # most images never see one.
@@ -1049,7 +1056,7 @@ class WipeView(CanvasView):
         style compare where neither half is "the output", so that caller turns
         it off and both pills read as neutral names.
         """
-        self._labels = (left, right) if (left or right) else None
+        self._labels = (tr(left), tr(right)) if (left or right) else None
         self._accent_right = accent_right
         self.update()
 
@@ -1354,7 +1361,7 @@ class SideBySideView(CanvasView):
         self.set_panes_u8([left, right])
 
     def set_labels(self, *labels: str) -> None:
-        self._labels = [text for text in labels]
+        self._labels = [tr(text) for text in labels]
         self.update()
 
     def clear(self) -> None:
@@ -1719,8 +1726,23 @@ class DownloadDialog(QDialog):
         self._detail.setText("  —  ".join(parts))
 
 
+class _ScrollSafeSlider(QSlider):
+    """A slider that never consumes the mouse wheel.
+
+    The sidebar itself scrolls vertically. Letting QSlider handle wheel events
+    makes ordinary page scrolling mutate parameters, and neural parameters can
+    launch a multi-second DLSS pass as a side effect.
+    """
+
+    def wheelEvent(self, event):  # noqa: N802 - Qt API
+        event.ignore()
+
+
 class SliderRow(QWidget):
     """A slider over 0..`maximum` with a live numeric readout."""
+
+    def setToolTip(self, text):  # noqa: N802 - Qt-style name
+        return super().setToolTip(tr(text))
 
     def __init__(
         self,
@@ -1753,7 +1775,7 @@ class SliderRow(QWidget):
         # a fraction of the range, so a 0..2 slider gets 200 positions and the
         # readout stays aimable at the same precision as a 0..1 one.
         self._steps = max(1, int(round((self._maximum - self._minimum) * 100)))
-        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider = _ScrollSafeSlider(Qt.Orientation.Horizontal)
         self._slider.setRange(0, self._steps)
         self._slider.setValue(self._to_raw(value))
         self._slider.valueChanged.connect(self._changed)
@@ -1895,6 +1917,9 @@ class ChipSliderGroup(QWidget):
     (a reset, a preset change) through ``set_value``.
     """
 
+    def setToolTip(self, text):  # noqa: N802 - Qt-style name
+        return super().setToolTip(tr(text))
+
     def __init__(
         self, params, mode: str = "compact", columns: int = 2,
         parent: QWidget | None = None,
@@ -1950,7 +1975,7 @@ class ChipSliderGroup(QWidget):
                 label, value, self._chip_setter(label, on_change), tooltip,
                 maximum=maximum, minimum=minimum,
             )
-            chip.setText(f"{label}  {row.formatted(value)}")
+            chip.setText(f"{tr(label)}  {row.formatted(value)}")
             self._rows_box.addWidget(row)
             self.rows[label] = row
             self._chips[label] = chip
@@ -1966,7 +1991,7 @@ class ChipSliderGroup(QWidget):
             chip = self._chips.get(label)
             row = self.rows.get(label)
             if chip is not None and row is not None:
-                chip.setText(f"{label}  {row.formatted(value)}")
+                chip.setText(f"{tr(label)}  {row.formatted(value)}")
             on_change(value)
         return wrapped
 
@@ -2010,6 +2035,9 @@ class SegmentedControl(QWidget):
     """
 
     changed = Signal(int)
+
+    def setToolTip(self, text):  # noqa: N802 - Qt-style name
+        return super().setToolTip(tr(text))
 
     def __init__(self, options, current: int = 0, parent: QWidget | None = None) -> None:
         super().__init__(parent)

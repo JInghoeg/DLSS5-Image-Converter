@@ -27,6 +27,19 @@ METHODS = {
 }
 SKIP_FILES = {"i18n.py", "i18n_widgets.py"}
 
+# Intentional non-translatable display tokens, or composite strings whose
+# human-readable pieces are translated before interpolation. Keeping these out
+# of the report lets the check fail only on real missing client copy.
+IGNORE_STRINGS = {
+    "%p%",
+    "DLSS<span style=\"color:{signal};\">·</span>5&nbsp;&nbsp;IMAGE&nbsp;&amp;&nbsp;VIDEO&nbsp;CONVERTER",
+    "GitHub",
+    "N",
+    "v{__version__}",
+    "{self._index + 1} · {tr(step.title)}",
+    "{tr(label)}  {row.formatted(value)}",
+}
+
 
 def _name(node: ast.AST) -> str:
     if isinstance(node, ast.Name):
@@ -97,7 +110,11 @@ def collect() -> dict[str, list[str]]:
 def main() -> int:
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     found = collect()
-    missing = {text: where for text, where in found.items() if text not in catalog}
+    missing = {
+        text: where
+        for text, where in found.items()
+        if text not in catalog and text not in IGNORE_STRINGS
+    }
 
     print(f"client strings detected : {len(found)}")
     print(f"zh-CN catalog entries   : {len(catalog)}")

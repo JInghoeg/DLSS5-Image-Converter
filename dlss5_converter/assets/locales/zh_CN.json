@@ -476,5 +476,21 @@
   "The add-on's HDR controls. This pipeline is SDR end to end, but these still change the result — the neural pass reasons about light before anything is tonemapped back. Defaults match the add-on's own.": "RenoDX 插件的 HDR 控制项。本工具最终仍输出 SDR，但这些参数会在色调映射前影响神经渲染对光照的判断，因此仍会改变结果。默认值与插件一致。",
   "The luminance the model treats as diffuse white. On an HDR or OLED display this decides how hard highlights are pushed. The add-on defaults to 1; shipping game configs use 16, where it stops changing.": "模型用于定义“漫反射白”的参考亮度。它不是显示器亮度，也不是普通曝光；会影响模型判断普通白色与高光之间的关系。插件默认值为 1，部分游戏配置使用 16；超过 16 后基本不再变化。",
   "Strength of the transfer curve the pass works through. Range 0..1.": "神经渲染所使用的 HDR 传递曲线强度。范围 0–1。",
-  "How much of the model's colour change is kept. At 0 the source colour survives and only structure changes. Range 0..1.": "控制保留多少“模型产生的色彩变化”，它不是普通饱和度。设为 0 时尽量保留原图颜色，仅保留结构/光照方面的神经变化；设为 1 时完整保留模型的色彩变化。某些图片上差异会比较小。范围 0–1。"
+  "How much of the model's colour change is kept. At 0 the source colour survives and only structure changes. Range 0..1.": "控制保留多少“模型产生的色彩变化”，它不是普通饱和度。设为 0 时尽量保留原图颜色，仅保留结构/光照方面的神经变化；设为 1 时完整保留模型的色彩变化。某些图片上差异会比较小。范围 0–1。",
+  "Could not read the image on the clipboard.": "无法读取剪贴板中的图片。",
+  "Depth estimation failed: {message}": "深度估算失败：{message}",
+  "Depth ready — tune contrast against the mask, then Convert.": "深度图已就绪。检查深度图后即可转换。",
+  "Done — Ultra rendered {fw}×{fh} (on disk). The preview is downscaled to fit; use Full-resolution… to view it, and Save result to keep the full-size image.": "完成 — Ultra 已渲染为 {fw}×{fh}（已写入磁盘）。当前预览已缩小以适应窗口；可使用“全分辨率…”查看，并通过“保存结果”保留完整尺寸图片。",
+  "Done — {result.notes}. Drag the divider to compare, or drop/paste another image.": "完成 — {result.notes}。拖动分隔线进行对比，或拖入/粘贴另一张图片。",
+  "Exposure, contrast, saturation and vibrance, applied to the finished image.\n\nAfter the neural pass, not before, so it is instant - nothing is re-evaluated and nothing is lost. Grading the input instead would change what the model sees and cost a full re-run per nudge.": "对最终图像调整曝光、对比度、饱和度和自然饱和度。\n\n这些调整发生在神经渲染之后，因此可以即时预览，不会重新执行 DLSS，也不会丢失结果。若在神经渲染前调整输入图像，会改变模型看到的内容，每次微调都需要完整重跑。",
+  "Make the {name} version the result, so Save exports it. Also sets the style in the sidebar, so the next conversion and any folder batch use it too.": "将 {name} 版本设为当前结果，保存时会导出该版本；同时更新侧栏中的风格，使下一次普通转换和文件夹批处理也使用它。",
+  "Nothing on the clipboard to paste.": "剪贴板中没有可粘贴的内容。",
+  "ONNX Runtime is missing from this build, so depth estimation cannot run. This is a packaging problem rather than something to download - please reinstall the app.\n\n{error}": "此构建缺少 ONNX Runtime，因此无法运行深度估算。这属于打包问题，并不是需要额外下载的组件；请重新安装应用。\n\n{error}",
+  "Opens the guide in your browser:\n{WIKI_URL}": "在浏览器中打开使用指南：\n{WIKI_URL}",
+  "Opens the project page:\n{GITHUB_URL}": "在浏览器中打开项目主页：\n{GITHUB_URL}",
+  "Preview — intensity {neural.intensity}, skin {neural.skin}, tone {neural.local_tone}, structure {neural.structure}": "预览 — 强度 {neural.intensity}，皮肤 {neural.skin}，局部色调 {neural.local_tone}，结构 {neural.structure}",
+  "VRAM  {used} / {total} GB": "显存  {used} / {total} GB",
+  "View the full super-resolution image (far larger than the preview). Opens a zoomable viewer; the preview here stays at the original size.": "查看完整的超分辨率图像（尺寸远大于当前预览）。会打开可缩放查看器；此处预览仍保持原始显示尺寸。",
+  "{error}\n\nThe PNG frames are in the output folder and can be encoded with anything.": "{error}\n\nPNG 图像帧已经保存在输出文件夹中，可使用任意编码工具继续处理。",
+  "{prefix}Result: {bw}×{bh} ({mp} MP) in {n_tiles} {tiles_word}{note}. Saved full size — pick PNG, JPEG or TIFF on Save.": "{prefix}结果：{bw}×{bh}（{mp} MP），共 {n_tiles} 个{tiles_word}{note}。将按完整尺寸保存；保存时可选择 PNG、JPEG 或 TIFF。"
 }
